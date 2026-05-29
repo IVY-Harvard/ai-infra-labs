@@ -1,0 +1,89 @@
+# RDMA Device Plugin DaemonSet
+# Exposes RDMA/RoCE devices as schedulable Kubernetes resources
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rdma-devices-config
+  namespace: kube-system
+data:
+  config.json: |
+    {
+      "periodicUpdateInterval": 300,
+      "configList": [
+        {
+          "resourceName": "rdma_shared_device",
+          "rdmaHcaMax": 1000,
+          "selectors": {
+            "vendors": ["15b3"],
+            "deviceIDs": ["101b", "1017"],
+            "ifNames": ["ens8f0", "ens8f1"]
+          }
+        },
+        {
+          "resourceName": "rdma_exclusive_device",
+          "rdmaHcaMax": 1,
+          "selectors": {
+            "vendors": ["15b3"],
+            "deviceIDs": ["101b"],
+            "ifNames": ["ens3f0np0"]
+          }
+        }
+      ]
+    }
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: rdma-shared-dp
+  namespace: kube-system
+  labels:
+    app: rdma-shared-dp
+spec:
+  selector:
+    matchLabels:
+      app: rdma-shared-dp
+  template:
+    metadata:
+      labels:
+        app: rdma-shared-dp
+    spec:
+      hostNetwork: true
+      priorityClassName: system-node-critical
+      tolerations:
+        - operator: Exists
+      nodeSelector:
+        feature.node.kubernetes.io/network-sriov.capable: "true"
+      containers:
+        - name: rdma-shared-dp
+          image: ghcr.io/mellanox/k8s-rdma-shared-dev-plugin:latest
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            privileged: true
+          resources:
+            requests:
+              cpu: 100m
+              memory: 50Mi
+            limits:
+              cpu: 300m
+              memory: 150Mi
+          volumeMounts:
+            - name: device-plugin
+              mountPath: /var/lib/kubelet/device-plugins
+            - name: config
+              mountPath: /k8s-rdma-shared-dev-plugin
+            - name: devinfiniband
+              mountPath: /dev/infiniband
+      volumes:
+        - name: device-plugin
+          hostPath:
+            path: /var/lib/kubelet/device-plugins
+        - name: config
+          configMap:
+            name: rdma-devices-config
+            items:
+              - key: config.json
+                path: config.json
+        - name: devinfiniband
+          hostPath:
+            path: /dev/infiniband

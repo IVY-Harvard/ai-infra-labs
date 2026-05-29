@@ -1,0 +1,49 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: fake-gpu-device-plugin
+  namespace: kube-system
+  labels:
+    app: fake-gpu-device-plugin
+spec:
+  selector:
+    matchLabels:
+      app: fake-gpu-device-plugin
+  template:
+    metadata:
+      labels:
+        app: fake-gpu-device-plugin
+    spec:
+      # 仅部署到有特定标签的节点（模拟 GPU 节点）
+      nodeSelector:
+        fake-gpu: "true"
+      tolerations:
+      - key: nvidia.com/gpu
+        operator: Exists
+        effect: NoSchedule
+      priorityClassName: system-node-critical
+      containers:
+      - name: fake-gpu-plugin
+        image: fake-gpu-plugin:v1
+        imagePullPolicy: IfNotPresent
+        securityContext:
+          # Device Plugin 需要访问 /var/lib/kubelet/device-plugins/
+          privileged: false
+        volumeMounts:
+        - name: device-plugin
+          mountPath: /var/lib/kubelet/device-plugins
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+          limits:
+            cpu: 100m
+            memory: 128Mi
+      volumes:
+      - name: device-plugin
+        hostPath:
+          path: /var/lib/kubelet/device-plugins
+          type: Directory
+---
+# 给节点打标签以启用 Fake GPU Plugin：
+# kubectl label node <node-name> fake-gpu=true

@@ -1,0 +1,49 @@
+# GPU Kernel Benchmark Suite 默认配置
+
+# GPU 理论峰值（根据实际 GPU 型号修改）
+gpu:
+  model: "H20"
+  peaks:
+    fp32_tflops: 44.0
+    tf32_tflops: 74.0
+    fp16_tflops: 148.0
+    bf16_tflops: 148.0
+    int8_tops: 296.0
+    hbm_bandwidth_gb_s: 4000.0
+    nvlink_bandwidth_gb_s: 900.0
+    pcie_bandwidth_gb_s: 64.0
+
+# 基准测试参数
+benchmark:
+  compute:
+    sizes: [2048, 4096, 8192]
+    warmup_runs: 10
+    benchmark_runs: 50
+    dtypes: ["fp32", "fp16", "int8"]
+
+  memory:
+    sizes_mb: [256, 512, 1024]
+    warmup_runs: 10
+    benchmark_runs: 50
+
+  p2p:
+    size_mb: 256
+    warmup_runs: 10
+    benchmark_runs: 50
+
+  nvlink:
+    sizes_mb: [64, 256, 1024]
+    warmup_runs: 5
+    benchmark_runs: 20
+
+# 报告配置
+report:
+  output_dir: "./results"
+  format: "html"  # html, json, csv
+
+# 告警阈值
+alerts:
+  compute_utilization_min: 70.0  # 低于此值告警
+  memory_bandwidth_utilization_min: 80.0
+  temperature_max: 83
+  p2p_bandwidth_min_gb_s: 200.0  # 低于此值可能 NVLink 有问题

@@ -1,0 +1,157 @@
+# Kueue Workload 演示
+#
+# 展示如何通过 Kueue 管理 GPU 训练和推理工作负载。
+# Kueue 通过 "suspend" 机制控制 Job 准入：
+#   - Job 提交时 suspend=true（不会被调度）
+#   - Kueue 检查配额和优先级
+#   - 满足条件 → 设置 suspend=false → Job 开始调度
+
+---
+# WorkloadPriorityClass 定义
+apiVersion: kueue.x-k8s.io/v1beta1
+kind: WorkloadPriorityClass
+metadata:
+  name: high-priority
+value: 1000
+description: "高优先级任务（生产训练）"
+---
+apiVersion: kueue.x-k8s.io/v1beta1
+kind: WorkloadPriorityClass
+metadata:
+  name: low-priority
+value: 100
+description: "低优先级任务（实验）"
+
+---
+# 示例 1：GPU 训练 Job（通过 Kueue 管理）
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: llm-finetune
+  namespace: team-training
+  labels:
+    kueue.x-k8s.io/queue-name: training-queue    # 指定 LocalQueue
+    kueue.x-k8s.io/priority-class: high-priority
+spec:
+  suspend: true              # Kueue 管理：初始暂停
+  parallelism: 4             # 4 个并行 worker
+  completions: 4
+  template:
+    spec:
+      containers:
+      - name: trainer
+        image: llm-training:latest
+        command:
+        - torchrun
+        - --nproc_per_node=2
+        - --nnodes=4
+        - --node_rank=$(JOB_COMPLETION_INDEX)
+        - --master_addr=llm-finetune-0
+        - --master_port=29400
+        - finetune.py
+        - --model=llama-70b
+        - --data=/data/instruction-tuning
+        - --output=/checkpoints/run-$(date +%s)
+        resources:
+          requests:
+            nvidia.com/gpu: 2
+            cpu: "8"
+            memory: "64Gi"
+          limits:
+            nvidia.com/gpu: 2
+            cpu: "8"
+            memory: "64Gi"
+        volumeMounts:
+        - name: data
+          mountPath: /data
+        - name: checkpoints
+          mountPath: /checkpoints
+      volumes:
+      - name: data
+        persistentVolumeClaim:
+          claimName: training-data
+      - name: checkpoints
+        persistentVolumeClaim:
+          claimName: training-checkpoints
+      restartPolicy: Never
+
+---
+# 示例 2：低优先级实验任务
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: hyperparameter-search
+  namespace: team-experiment
+  labels:
+    kueue.x-k8s.io/queue-name: experiment-queue
+    kueue.x-k8s.io/priority-class: low-priority
+spec:
+  suspend: true
+  parallelism: 2
+  completions: 8          # 8 组超参数试验
+  template:
+    spec:
+      containers:
+      - name: experiment
+        image: ml-experiment:latest
+        command:
+        - python
+        - run_experiment.py
+        - --trial-id=$(JOB_COMPLETION_INDEX)
+        resources:
+          requests:
+            nvidia.com/gpu: 1
+            cpu: "4"
+            memory: "32Gi"
+          limits:
+            nvidia.com/gpu: 1
+      restartPolicy: Never
+
+---
+# 示例 3：PyTorchJob + Kueue (Kubeflow Training Operator 集成)
+apiVersion: kubeflow.org/v1
+kind: PyTorchJob
+metadata:
+  name: distributed-training-kueue
+  namespace: team-training
+  labels:
+    kueue.x-k8s.io/queue-name: training-queue
+    kueue.x-k8s.io/priority-class: high-priority
+spec:
+  pytorchReplicaSpecs:
+    Master:
+      replicas: 1
+      template:
+        spec:
+          containers:
+          - name: trainer
+            image: pytorch-training:latest
+            resources:
+              limits:
+                nvidia.com/gpu: 2
+    Worker:
+      replicas: 3
+      template:
+        spec:
+          containers:
+          - name: trainer
+            image: pytorch-training:latest
+            resources:
+              limits:
+                nvidia.com/gpu: 2
+
+---
+# 查看 Workload 状态的命令：
+#
+# kubectl get workloads -n team-training
+# NAME                           QUEUE            ADMITTED   AGE
+# job-llm-finetune-xxxxx         training-queue   True       5m
+#
+# kubectl describe workload job-llm-finetune-xxxxx -n team-training
+# → Conditions:
+#   Type       Status   Reason
+#   Admitted   True     Admitted   ← 已被准入，Job 开始运行
+#
+# 如果配额不足：
+#   Admitted   False    Pending    ← 排队中
+#   Message: "insufficient unused quota for nvidia.com/gpu in flavor h20-gpu"

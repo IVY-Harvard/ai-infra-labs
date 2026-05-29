@@ -1,0 +1,45 @@
+# 测试 Fake GPU Device Plugin 的 Pod
+apiVersion: v1
+kind: Pod
+metadata:
+  name: fake-gpu-test
+spec:
+  containers:
+  - name: test
+    image: busybox:latest
+    command:
+    - sh
+    - -c
+    - |
+      echo "=== Fake GPU 环境变量 ==="
+      echo "GPU IDs: $FAKE_GPU_IDS"
+      echo "GPU Count: $FAKE_GPU_COUNT"
+      echo "CUDA Version: $FAKE_CUDA_VERSION"
+      echo ""
+      echo "=== 设备挂载 ==="
+      ls -la /dev/fake-gpu 2>/dev/null || echo "无 /dev/fake-gpu"
+      ls -la /dev/fake-nvidia0 2>/dev/null || echo "无 /dev/fake-nvidia0"
+      echo ""
+      echo "=== 测试完成 ==="
+      sleep 30
+    resources:
+      limits:
+        fake.com/gpu: 2    # 请求 2 个 Fake GPU
+      requests:
+        fake.com/gpu: 2
+  restartPolicy: Never
+---
+# 多 GPU 请求测试
+apiVersion: v1
+kind: Pod
+metadata:
+  name: fake-gpu-test-4gpu
+spec:
+  containers:
+  - name: test
+    image: busybox:latest
+    command: ["sh", "-c", "echo GPU_IDS=$FAKE_GPU_IDS; sleep 30"]
+    resources:
+      limits:
+        fake.com/gpu: 4    # 请求 4 个 Fake GPU
+  restartPolicy: Never

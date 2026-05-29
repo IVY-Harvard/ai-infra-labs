@@ -1,0 +1,94 @@
+# =============================================================================
+# DCGM Exporter 自定义指标采集清单
+#
+# 格式: DCGM_FI_<field_id>, <type>, <description>
+#
+# 设计原则:
+#   1. 只采集对 LLM 推理场景真正有用的指标
+#   2. Profiling Metrics 必须全部开启（性能分析核心）
+#   3. Health Metrics 精简到能覆盖 90% 故障场景
+#   4. 去掉冗余的 legacy 指标（如 PCIe throughput — 推理场景不关注）
+#
+# 部署方式:
+#   将此文件挂载到 DCGM Exporter 容器的 /etc/dcgm-exporter/custom-metrics.csv
+#   启动参数: --collectors /etc/dcgm-exporter/custom-metrics.csv
+#
+# 参考: https://docs.nvidia.com/datacenter/dcgm/latest/dcgm-api/dcgm-api-field-ids.html
+# =============================================================================
+
+# ==========================
+# Profiling Metrics (核心)
+# ==========================
+# 这些指标揭示 GPU 真实计算效率，是判断 "GPU 到底在干什么" 的关键
+
+# SM 活跃率：至少有 1 个 warp 在执行的 SM 时间占比
+DCGM_FI_PROF_SM_ACTIVE, gauge, SM Active ratio
+
+# SM Occupancy：常驻 warp 数 / SM 最大 warp 容量
+DCGM_FI_PROF_SM_OCCUPANCY, gauge, SM Occupancy ratio
+
+# Tensor Core 管线活跃率：AI 计算效率的 #1 指标
+DCGM_FI_PROF_PIPE_TENSOR_ACTIVE, gauge, Tensor Core pipe active ratio
+
+# FP32 管线活跃率：非 Tensor Core 的通用计算
+DCGM_FI_PROF_PIPE_FP32_ACTIVE, gauge, FP32 pipe active ratio
+
+# FP16 管线活跃率
+DCGM_FI_PROF_PIPE_FP16_ACTIVE, gauge, FP16 pipe active ratio
+
+# DRAM (HBM) 活跃率：显存带宽利用率
+DCGM_FI_PROF_DRAM_ACTIVE, gauge, DRAM (HBM) active ratio
+
+# NVLink 发送字节数
+DCGM_FI_PROF_NVLINK_TX_BYTES, gauge, NVLink TX bytes per second
+
+# NVLink 接收字节数
+DCGM_FI_PROF_NVLINK_RX_BYTES, gauge, NVLink RX bytes per second
+
+# PCIe 发送字节数（用于 CPU-GPU 数据传输监控）
+DCGM_FI_PROF_PCIE_TX_BYTES, gauge, PCIe TX bytes per second
+
+# PCIe 接收字节数
+DCGM_FI_PROF_PCIE_RX_BYTES, gauge, PCIe RX bytes per second
+
+# ==========================
+# Health Metrics (健康监控)
+# ==========================
+# 精简到能覆盖温度、功率、ECC、限频四大故障场景
+
+# GPU 核心温度
+DCGM_FI_DEV_GPU_TEMP, gauge, GPU temperature (C)
+
+# HBM 温度（H20 的 HBM3 对温度敏感）
+DCGM_FI_DEV_MEMORY_TEMP, gauge, Memory temperature (C)
+
+# 实时功耗
+DCGM_FI_DEV_POWER_USAGE, gauge, Power usage (W)
+
+# 单比特 ECC 错误累计
+DCGM_FI_DEV_ECC_SBE_VOL_TOTAL, gauge, ECC single-bit errors (volatile)
+
+# 双比特 ECC 错误累计（不可纠正，严重）
+DCGM_FI_DEV_ECC_DBE_VOL_TOTAL, gauge, ECC double-bit errors (volatile)
+
+# 限频原因 bitmap
+DCGM_FI_DEV_CLOCK_THROTTLE_REASONS, gauge, Clock throttle reasons bitmap
+
+# PCIe 重传计数（链路质量指标）
+DCGM_FI_DEV_PCIE_REPLAY_COUNTER, gauge, PCIe replay counter
+
+# ==========================
+# Memory & Clock (资源追踪)
+# ==========================
+
+# 已用显存 (MB)
+DCGM_FI_DEV_FB_USED, gauge, Framebuffer memory used (MB)
+
+# 空闲显存 (MB)
+DCGM_FI_DEV_FB_FREE, gauge, Framebuffer memory free (MB)
+
+# SM 时钟频率 (MHz)
+DCGM_FI_DEV_SM_CLOCK, gauge, SM clock speed (MHz)
+
+# 显存时钟频率 (MHz)
+DCGM_FI_DEV_MEM_CLOCK, gauge, Memory clock speed (MHz)

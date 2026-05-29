@@ -1,0 +1,31 @@
+# ──────── Web Framework ────────
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+pydantic>=2.5.0
+
+# ──────── Storage ────────
+boto3>=1.29.0          # S3 / MinIO
+redis>=5.0.0           # 元数据缓存
+
+# ──────── Model Format ────────
+safetensors>=0.4.0     # safetensors 读写
+torch>=2.1.0           # PyTorch 模型加载（可选，按需安装）
+
+# ──────── Data Processing ────────
+numpy>=1.24.0
+pyarrow>=14.0.0        # Parquet / Arrow 格式
+
+# ──────── Monitoring ────────
+prometheus-client>=0.19.0
+structlog>=23.2.0      # 结构化日志
+
+# ──────── Testing ────────
+pytest>=7.4.0
+pytest-asyncio>=0.23.0
+httpx>=0.25.0          # FastAPI TestClient 依赖
+
+# ──────── Utilities ────────
+python-multipart>=0.0.6   # 文件上传
+tenacity>=8.2.0           # 重试
+click>=8.1.0              # CLI 工具
+tqdm>=4.66.0              # 进度条

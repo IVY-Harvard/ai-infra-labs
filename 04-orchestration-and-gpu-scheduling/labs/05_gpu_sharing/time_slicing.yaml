@@ -1,0 +1,116 @@
+# NVIDIA Device Plugin Time-Slicing 配置
+#
+# Time-Slicing 让多个 Pod "共享"同一张 GPU，通过时间片轮转方式。
+# 这是最简单的 GPU 共享方式，不需要修改工作负载代码。
+#
+# 适用场景：
+#   - 开发/测试环境，多人共享 GPU
+#   - 推理服务，GPU 利用率低时
+#
+# 限制：
+#   - 没有显存隔离（所有 Pod 可以看到全部显存）
+#   - 性能会因上下文切换有 10-30% 损失
+#   - 不适合训练任务
+
+---
+# ConfigMap：Device Plugin 配置
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: device-plugin-config
+  namespace: gpu-operator
+data:
+  h20-time-slicing: |
+    version: v1
+    sharing:
+      timeSlicing:
+        renameByDefault: true        # 资源名改为 nvidia.com/gpu.shared
+        failRequestsGreaterThanOne: false
+        resources:
+        - name: nvidia.com/gpu
+          replicas: 4                # 每张 GPU 切成 4 个虚拟 GPU
+          # 8 张 H20 × 4 replicas = 32 个 nvidia.com/gpu 可分配
+
+  h20-no-sharing: |
+    version: v1
+    sharing:
+      timeSlicing:
+        renameByDefault: false
+        resources:
+        - name: nvidia.com/gpu
+          replicas: 1                # 不共享，1:1 分配
+
+---
+# 使用 Time-Slicing 后的节点资源视图
+#
+# 原始（无共享）：
+#   nvidia.com/gpu: 8
+#
+# Time-Slicing (replicas=4)：
+#   nvidia.com/gpu: 32              # 8 × 4 = 32 (如果 renameByDefault=false)
+#   # 或者
+#   nvidia.com/gpu.shared: 32       # (如果 renameByDefault=true)
+#   nvidia.com/gpu: 8               # 仍保留原始资源
+
+---
+# 应用配置到节点
+# 方法 1：通过 GPU Operator ClusterPolicy
+apiVersion: nvidia.com/v1
+kind: ClusterPolicy
+metadata:
+  name: cluster-policy
+spec:
+  devicePlugin:
+    config:
+      name: device-plugin-config
+      default: h20-time-slicing      # 默认使用 time-slicing 配置
+
+---
+# 方法 2：通过节点标签选择不同配置
+# 给推理节点用 time-slicing，训练节点不共享
+#
+# kubectl label node inference-node nvidia.com/device-plugin.config=h20-time-slicing
+# kubectl label node training-node nvidia.com/device-plugin.config=h20-no-sharing
+
+---
+# 使用 Time-Slicing GPU 的 Pod 示例
+apiVersion: v1
+kind: Pod
+metadata:
+  name: inference-timeslice
+spec:
+  containers:
+  - name: inference
+    image: my-inference:latest
+    resources:
+      limits:
+        nvidia.com/gpu: 1    # 获得 1/4 的 GPU 时间片
+        # 注意：显存上限仍然是 96GB（无隔离）
+        # 应用需要自己控制显存使用
+
+---
+# 推理 Deployment 使用 Time-Slicing
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: multi-model-inference
+spec:
+  replicas: 4    # 4 个推理服务共享 1 张 GPU
+  selector:
+    matchLabels:
+      app: inference
+  template:
+    metadata:
+      labels:
+        app: inference
+    spec:
+      containers:
+      - name: inference
+        image: vllm:latest
+        args:
+        - "--model=/models/llama-7b"
+        - "--gpu-memory-utilization=0.2"    # 限制只用 20% 显存
+        - "--max-model-len=2048"
+        resources:
+          limits:
+            nvidia.com/gpu: 1

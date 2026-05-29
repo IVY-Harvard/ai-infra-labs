@@ -1,0 +1,51 @@
+# Llama-3-8B DPO 偏好优化配置
+experiment:
+  name: llama3-8b-dpo
+  description: "Llama-3-8B DPO 偏好优化"
+
+model:
+  name: "meta-llama/Meta-Llama-3-8B-Instruct"
+  revision: "main"
+  torch_dtype: "bfloat16"
+
+method:
+  type: "dpo"
+  dpo:
+    beta: 0.1
+    loss_type: "sigmoid"
+    max_prompt_length: 1024
+    ref_model: null  # 使用同一模型作为 reference
+
+data:
+  train_file: "data/preference_train.jsonl"
+  eval_file: "data/preference_eval.jsonl"
+  format: "preference"
+  max_seq_length: 2048
+
+training:
+  num_epochs: 1
+  batch_size: 2
+  gradient_accumulation: 8
+  learning_rate: 5.0e-7
+  lr_scheduler: "cosine"
+  warmup_ratio: 0.1
+  weight_decay: 0.01
+  bf16: true
+  gradient_checkpointing: true
+
+distributed:
+  num_gpus: 2
+  strategy: "ddp"
+
+evaluation:
+  benchmarks:
+    - mmlu
+    - mt_bench
+  eval_steps: 200
+  quality_threshold: 0.6
+
+output:
+  dir: "outputs/llama3-8b-dpo"
+  save_steps: 200
+  save_total_limit: 3
+  logging_steps: 10

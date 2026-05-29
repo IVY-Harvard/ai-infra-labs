@@ -1,0 +1,210 @@
+# 弹性训练配置（PyTorch Elastic on Spot Instances）
+#
+# 使用 Kubeflow Training Operator 的 ElasticPolicy，
+# 允许 worker 数量在 Spot 中断时动态调整。
+#
+# 关键概念：
+#   minReplicas: 最少 worker 数（保证训练不停）
+#   maxReplicas: 最多 worker 数（有更多 Spot 就扩展）
+#   maxRestarts: 允许重启次数
+
+---
+# PriorityClass：Spot 训练任务可被抢占
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: spot-training
+value: 500
+globalDefault: false
+description: "Spot 实例上的训练任务，可被驱逐"
+---
+# PriorityClass：On-Demand 保底 worker
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: guaranteed-training
+value: 10000
+globalDefault: false
+description: "On-Demand 实例上的保底 worker"
+
+---
+# 弹性训练 PyTorchJob
+apiVersion: kubeflow.org/v1
+kind: PyTorchJob
+metadata:
+  name: elastic-llm-training
+  namespace: ml-training
+spec:
+  elasticPolicy:
+    rdzvBackend: c10d
+    minReplicas: 1          # 最少 1 个 worker（On-Demand 保底）
+    maxReplicas: 4          # 最多 4 个 worker
+    maxRestarts: 10         # Spot 中断后最多重启 10 次
+    metrics:
+    - type: Resource
+      resource:
+        name: nvidia.com/gpu
+        targetAverageUtilization: 80
+  pytorchReplicaSpecs:
+    Worker:
+      replicas: 4           # 初始 4 个 worker
+      restartPolicy: OnFailure
+      template:
+        metadata:
+          labels:
+            app: elastic-training
+        spec:
+          # 保底 worker 调度到 On-Demand 节点
+          # 其余 worker 调度到 Spot 节点
+          affinity:
+            nodeAffinity:
+              preferredDuringSchedulingIgnoredDuringExecution:
+              - weight: 80
+                preference:
+                  matchExpressions:
+                  - key: cloud.provider/instance-lifecycle
+                    operator: In
+                    values: ["spot"]
+          tolerations:
+          - key: cloud.provider/spot
+            operator: Equal
+            value: "true"
+            effect: NoSchedule
+          terminationGracePeriodSeconds: 30  # Spot 中断优雅期
+          containers:
+          - name: trainer
+            image: elastic-training:latest
+            command:
+            - python
+            - -m
+            - torch.distributed.run
+            - --nproc_per_node=2
+            - --rdzv_backend=c10d
+            - --rdzv_endpoint=elastic-llm-training-worker-0:29400
+            - --max_restarts=3
+            - train.py
+            - --checkpoint-dir=/checkpoints
+            - --checkpoint-interval=300     # 每 5 分钟 checkpoint
+            - --elastic-mode=true
+            env:
+            - name: NCCL_DEBUG
+              value: "WARN"
+            - name: TORCH_NCCL_ASYNC_ERROR_HANDLING
+              value: "1"
+            resources:
+              limits:
+                nvidia.com/gpu: 2
+                cpu: "8"
+                memory: "64Gi"
+              requests:
+                nvidia.com/gpu: 2
+                cpu: "8"
+                memory: "64Gi"
+            volumeMounts:
+            - name: checkpoints
+              mountPath: /checkpoints
+            - name: data
+              mountPath: /data
+            # Spot 中断处理 sidecar
+          - name: spot-handler
+            image: spot-handler:latest
+            command:
+            - python
+            - spot_handler.py
+            - --provider=k8s
+            - --checkpoint-dir=/checkpoints
+            - --graceful-period=25
+            volumeMounts:
+            - name: checkpoints
+              mountPath: /checkpoints
+            resources:
+              requests:
+                cpu: "100m"
+                memory: "128Mi"
+          volumes:
+          - name: checkpoints
+            persistentVolumeClaim:
+              claimName: elastic-training-ckpt   # 共享存储
+          - name: data
+            persistentVolumeClaim:
+              claimName: training-dataset
+
+---
+# 共享 Checkpoint PVC（所有 worker 都可以读写）
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: elastic-training-ckpt
+  namespace: ml-training
+spec:
+  accessModes:
+  - ReadWriteMany        # 多节点读写
+  storageClassName: nfs  # NFS 或类似共享存储
+  resources:
+    requests:
+      storage: 500Gi     # 70B 模型 checkpoint ~140GB × 几个版本
+
+---
+# Node Termination Handler DaemonSet（在 Spot 节点上运行）
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: node-termination-handler
+  namespace: kube-system
+spec:
+  selector:
+    matchLabels:
+      app: node-termination-handler
+  template:
+    metadata:
+      labels:
+        app: node-termination-handler
+    spec:
+      nodeSelector:
+        cloud.provider/instance-lifecycle: spot
+      serviceAccountName: node-termination-handler
+      containers:
+      - name: handler
+        image: aws-node-termination-handler:latest  # 或对应云的版本
+        env:
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        - name: ENABLE_SPOT_INTERRUPTION_DRAINING
+          value: "true"
+        - name: GRACE_PERIOD
+          value: "25"
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+
+---
+# Cluster Autoscaler 配置（自动补充 Spot 节点）
+# 当 Spot 实例被回收后，Autoscaler 尝试获取新的 Spot 实例
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cluster-autoscaler-config
+  namespace: kube-system
+data:
+  config: |
+    {
+      "nodeGroups": [
+        {
+          "name": "spot-gpu-pool",
+          "minSize": 0,
+          "maxSize": 4,
+          "instanceTypes": ["p4d.24xlarge", "p5.48xlarge"],
+          "spot": true
+        },
+        {
+          "name": "ondemand-gpu-pool",
+          "minSize": 1,
+          "maxSize": 1,
+          "instanceTypes": ["p4d.24xlarge"],
+          "spot": false
+        }
+      ]
+    }

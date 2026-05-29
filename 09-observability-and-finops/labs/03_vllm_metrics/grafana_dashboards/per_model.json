@@ -1,0 +1,410 @@
+{
+  "__comment": "vLLM 模型级分析 Dashboard — 按模型对比性能与资源消耗",
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": "-- Grafana --",
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "description": "按模型维度分析推理性能、资源消耗、成本效率，支持多模型对比",
+  "editable": true,
+  "gnetId": null,
+  "graphTooltip": 1,
+  "id": null,
+  "panels": [
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "id": 100,
+      "title": "Model Comparison — 模型对比概览",
+      "type": "row"
+    },
+    {
+      "id": 1,
+      "title": "Generation Throughput by Model (tokens/s)",
+      "description": "按模型分组的生成吞吐量 — 衡量每个模型的 Decode 效率",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 1 },
+      "datasource": "${DS_PROMETHEUS}",
+      "targets": [
+        {
+          "expr": "sum by (model) (rate(vllm:generation_tokens_total{model=~\"$model\", instance=~\"$instance\"}[1m]))",
+          "legendFormat": "{{ model }}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "tokens/s",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 15,
+            "pointSize": 5,
+            "showPoints": "auto"
+          }
+        }
+      },
+      "options": {
+        "tooltip": { "mode": "multi", "sort": "desc" },
+        "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["mean", "max", "last"] }
+      }
+    },
+    {
+      "id": 2,
+      "title": "Prompt Throughput by Model (tokens/s)",
+      "description": "按模型分组的 Prompt 处理吞吐量 — 衡量 Prefill 效率",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 1 },
+      "datasource": "${DS_PROMETHEUS}",
+      "targets": [
+        {
+          "expr": "sum by (model) (rate(vllm:prompt_tokens_total{model=~\"$model\", instance=~\"$instance\"}[1m]))",
+          "legendFormat": "{{ model }}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "tokens/s",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 15
+          }
+        }
+      },
+      "options": {
+        "tooltip": { "mode": "multi", "sort": "desc" },
+        "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["mean", "max", "last"] }
+      }
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 9 },
+      "id": 101,
+      "title": "Latency by Model — 按模型延迟分析",
+      "type": "row"
+    },
+    {
+      "id": 10,
+      "title": "TTFT P50/P90/P99 by Model",
+      "description": "按模型分组的 TTFT 分位数 — 不同模型 Prefill 耗时差异巨大",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 10 },
+      "datasource": "${DS_PROMETHEUS}",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum by (le, model) (rate(vllm:time_to_first_token_seconds_bucket{model=~\"$model\", instance=~\"$instance\"}[5m])))",
+          "legendFormat": "{{ model }} P50"
+        },
+        {
+          "expr": "histogram_quantile(0.90, sum by (le, model) (rate(vllm:time_to_first_token_seconds_bucket{model=~\"$model\", instance=~\"$instance\"}[5m])))",
+          "legendFormat": "{{ model }} P90"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le, model) (rate(vllm:time_to_first_token_seconds_bucket{model=~\"$model\", instance=~\"$instance\"}[5m])))",
+          "legendFormat": "{{ model }} P99"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 5
+          }
+        }
+      },
+      "options": {
+        "tooltip": { "mode": "multi", "sort": "desc" },
+        "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["mean", "max", "last"] }
+      }
+    },
+    {
+      "id": 11,
+      "title": "TPOT P50/P90/P99 by Model",
+      "description": "按模型分组的 TPOT 分位数 — 反映 Decode 阶段每 token 延迟",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 10 },
+      "datasource": "${DS_PROMETHEUS}",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum by (le, model) (rate(vllm:time_per_output_token_seconds_bucket{model=~\"$model\", instance=~\"$instance\"}[5m]))) * 1000",
+          "legendFormat": "{{ model }} P50"
+        },
+        {
+          "expr": "histogram_quantile(0.90, sum by (le, model) (rate(vllm:time_per_output_token_seconds_bucket{model=~\"$model\", instance=~\"$instance\"}[5m]))) * 1000",
+          "legendFormat": "{{ model }} P90"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le, model) (rate(vllm:time_per_output_token_seconds_bucket{model=~\"$model\", instance=~\"$instance\"}[5m]))) * 1000",
+          "legendFormat": "{{ model }} P99"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 5
+          }
+        }
+      },
+      "options": {
+        "tooltip": { "mode": "multi", "sort": "desc" },
+        "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["mean", "max", "last"] }
+      }
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 18 },
+      "id": 102,
+      "title": "Resource Usage by Model — 按模型资源消耗",
+      "type": "row"
+    },
+    {
+      "id": 20,
+      "title": "Request States by Model",
+      "description": "按模型分组的请求状态 — Running/Waiting/Swapped 分布",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 19 },
+      "datasource": "${DS_PROMETHEUS}",
+      "targets": [
+        {
+          "expr": "sum by (model) (vllm:num_requests_running{model=~\"$model\", instance=~\"$instance\"})",
+          "legendFormat": "{{ model }} Running"
+        },
+        {
+          "expr": "sum by (model) (vllm:num_requests_waiting{model=~\"$model\", instance=~\"$instance\"})",
+          "legendFormat": "{{ model }} Waiting"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 15
+          }
+        }
+      },
+      "options": {
+        "tooltip": { "mode": "multi", "sort": "desc" },
+        "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["mean", "max", "last"] }
+      }
+    },
+    {
+      "id": 21,
+      "title": "Error Rate by Model (%)",
+      "description": "按模型的请求错误率 — 快速定位哪个模型出了问题",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 19 },
+      "datasource": "${DS_PROMETHEUS}",
+      "targets": [
+        {
+          "expr": "sum by (model) (rate(vllm:request_failure_total{model=~\"$model\", instance=~\"$instance\"}[5m])) / (sum by (model) (rate(vllm:request_success_total{model=~\"$model\", instance=~\"$instance\"}[5m])) + sum by (model) (rate(vllm:request_failure_total{model=~\"$model\", instance=~\"$instance\"}[5m])) + 1e-10) * 100",
+          "legendFormat": "{{ model }}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": 0 },
+              { "color": "yellow", "value": 1 },
+              { "color": "red", "value": 5 }
+            ]
+          }
+        }
+      },
+      "options": {
+        "tooltip": { "mode": "multi", "sort": "desc" },
+        "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["mean", "max", "last"] }
+      }
+    },
+    {
+      "id": 22,
+      "title": "E2E Latency P99 by Model",
+      "description": "按模型的端到端请求延迟 P99 — 包含排队 + Prefill + Decode 全部耗时",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 19 },
+      "datasource": "${DS_PROMETHEUS}",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum by (le, model) (rate(vllm:e2e_request_latency_seconds_bucket{model=~\"$model\", instance=~\"$instance\"}[5m])))",
+          "legendFormat": "{{ model }} P99"
+        },
+        {
+          "expr": "histogram_quantile(0.50, sum by (le, model) (rate(vllm:e2e_request_latency_seconds_bucket{model=~\"$model\", instance=~\"$instance\"}[5m])))",
+          "legendFormat": "{{ model }} P50"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10
+          }
+        }
+      },
+      "options": {
+        "tooltip": { "mode": "multi", "sort": "desc" },
+        "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["mean", "max", "last"] }
+      }
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 27 },
+      "id": 103,
+      "title": "Cost Efficiency — 成本效率对比",
+      "type": "row"
+    },
+    {
+      "id": 30,
+      "title": "Tokens per GPU-Hour by Model",
+      "description": "每 GPU 小时生成的 token 数 — 模型效率的核心成本指标",
+      "type": "bargauge",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 28 },
+      "datasource": "${DS_PROMETHEUS}",
+      "targets": [
+        {
+          "expr": "sum by (model) (rate(vllm:generation_tokens_total{model=~\"$model\", instance=~\"$instance\"}[30m])) * 3600",
+          "legendFormat": "{{ model }}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": 0 },
+              { "color": "yellow", "value": 500000 },
+              { "color": "green", "value": 2000000 }
+            ]
+          }
+        }
+      },
+      "options": {
+        "orientation": "horizontal",
+        "displayMode": "gradient",
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "showUnfilled": true
+      }
+    },
+    {
+      "id": 31,
+      "title": "Model Latency / Throughput Scatter Summary",
+      "description": "模型 TTFT P50 vs 吞吐量汇总表 — 综合对比每个模型的性能特征",
+      "type": "table",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 28 },
+      "datasource": "${DS_PROMETHEUS}",
+      "targets": [
+        {
+          "expr": "sum by (model) (rate(vllm:generation_tokens_total{model=~\"$model\"}[5m]))",
+          "legendFormat": "Gen toks/s",
+          "instant": true,
+          "format": "table",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.50, sum by (le, model) (rate(vllm:time_to_first_token_seconds_bucket{model=~\"$model\"}[5m])))",
+          "legendFormat": "TTFT P50",
+          "instant": true,
+          "format": "table",
+          "refId": "B"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le, model) (rate(vllm:time_per_output_token_seconds_bucket{model=~\"$model\"}[5m]))) * 1000",
+          "legendFormat": "TPOT P99 (ms)",
+          "instant": true,
+          "format": "table",
+          "refId": "C"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "merge",
+          "options": {}
+        },
+        {
+          "id": "organize",
+          "options": {
+            "renameByName": {
+              "model": "Model",
+              "Value #A": "Gen toks/s",
+              "Value #B": "TTFT P50 (s)",
+              "Value #C": "TPOT P99 (ms)"
+            }
+          }
+        }
+      ],
+      "options": {
+        "showHeader": true,
+        "footer": { "show": false }
+      }
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 38,
+  "style": "dark",
+  "tags": ["vllm", "inference", "per-model"],
+  "templating": {
+    "list": [
+      {
+        "allValue": ".*",
+        "current": {},
+        "datasource": "${DS_PROMETHEUS}",
+        "definition": "label_values(vllm:generation_tokens_total, model)",
+        "hide": 0,
+        "includeAll": true,
+        "label": "Model",
+        "multi": true,
+        "name": "model",
+        "query": "label_values(vllm:generation_tokens_total, model)",
+        "refresh": 2,
+        "sort": 1,
+        "type": "query"
+      },
+      {
+        "allValue": ".*",
+        "current": {},
+        "datasource": "${DS_PROMETHEUS}",
+        "definition": "label_values(vllm:generation_tokens_total, instance)",
+        "hide": 0,
+        "includeAll": true,
+        "label": "Instance",
+        "multi": true,
+        "name": "instance",
+        "query": "label_values(vllm:generation_tokens_total, instance)",
+        "refresh": 2,
+        "sort": 1,
+        "type": "query"
+      }
+    ]
+  },
+  "time": { "from": "now-3h", "to": "now" },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "vLLM Per-Model Analysis — 模型级分析",
+  "uid": "vllm-per-model",
+  "version": 1
+}

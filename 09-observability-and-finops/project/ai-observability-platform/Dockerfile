@@ -1,0 +1,16 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY src/ ./src/
+
+ENV PYTHONPATH=/app
+ENV PROMETHEUS_URL=http://prometheus:9090
+ENV LISTEN_PORT=8080
+
+EXPOSE 8080
+
+CMD ["uvicorn", "src.dashboard.api:app", "--host", "0.0.0.0", "--port", "8080"]

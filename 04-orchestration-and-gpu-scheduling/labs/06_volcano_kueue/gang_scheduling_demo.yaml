@@ -1,0 +1,248 @@
+# Volcano Gang Scheduling 演示
+#
+# Gang Scheduling 确保分布式训练的所有 worker 要么全部调度成功，
+# 要么全部不调度。避免"部分调度"导致的资源死锁。
+#
+# 场景：4-worker 分布式训练，每个 worker 需要 2 GPU
+# 集群：8x H20 GPU
+# 如果没有 Gang Scheduling：可能只调度了 2 个 worker，
+#   剩下的等待资源 → 2 个已调度的 worker 也在空等 → 死锁
+
+---
+# PodGroup 定义（Gang Scheduling 的核心）
+apiVersion: scheduling.volcano.sh/v1beta1
+kind: PodGroup
+metadata:
+  name: training-gang
+spec:
+  minMember: 4         # 至少 4 个 Pod 才开始调度
+  queue: training-queue
+  minResources:
+    nvidia.com/gpu: "8"   # 总共需要 8 GPU
+    cpu: "32"
+    memory: "256Gi"
+
+---
+# Worker 0 (Master)
+apiVersion: v1
+kind: Pod
+metadata:
+  name: training-worker-0
+  annotations:
+    scheduling.volcano.sh/group-name: training-gang
+  labels:
+    job-name: distributed-training
+    role: worker
+spec:
+  schedulerName: volcano
+  containers:
+  - name: trainer
+    image: pytorch-training:latest
+    command:
+    - torchrun
+    - --nproc_per_node=2
+    - --nnodes=4
+    - --node_rank=0
+    - --master_addr=training-worker-0
+    - --master_port=29400
+    - train.py
+    - --checkpoint-dir=/checkpoints
+    ports:
+    - containerPort: 29400
+      name: master-port
+    resources:
+      limits:
+        nvidia.com/gpu: 2
+        cpu: "8"
+        memory: "64Gi"
+    volumeMounts:
+    - name: checkpoint-vol
+      mountPath: /checkpoints
+    - name: dataset-vol
+      mountPath: /data
+  volumes:
+  - name: checkpoint-vol
+    persistentVolumeClaim:
+      claimName: training-checkpoints
+  - name: dataset-vol
+    persistentVolumeClaim:
+      claimName: training-dataset
+  restartPolicy: Never
+
+---
+# Worker 1
+apiVersion: v1
+kind: Pod
+metadata:
+  name: training-worker-1
+  annotations:
+    scheduling.volcano.sh/group-name: training-gang
+  labels:
+    job-name: distributed-training
+    role: worker
+spec:
+  schedulerName: volcano
+  containers:
+  - name: trainer
+    image: pytorch-training:latest
+    command:
+    - torchrun
+    - --nproc_per_node=2
+    - --nnodes=4
+    - --node_rank=1
+    - --master_addr=training-worker-0
+    - --master_port=29400
+    - train.py
+    - --checkpoint-dir=/checkpoints
+    resources:
+      limits:
+        nvidia.com/gpu: 2
+        cpu: "8"
+        memory: "64Gi"
+    volumeMounts:
+    - name: checkpoint-vol
+      mountPath: /checkpoints
+    - name: dataset-vol
+      mountPath: /data
+  volumes:
+  - name: checkpoint-vol
+    persistentVolumeClaim:
+      claimName: training-checkpoints
+  - name: dataset-vol
+    persistentVolumeClaim:
+      claimName: training-dataset
+  restartPolicy: Never
+
+---
+# Worker 2
+apiVersion: v1
+kind: Pod
+metadata:
+  name: training-worker-2
+  annotations:
+    scheduling.volcano.sh/group-name: training-gang
+  labels:
+    job-name: distributed-training
+    role: worker
+spec:
+  schedulerName: volcano
+  containers:
+  - name: trainer
+    image: pytorch-training:latest
+    command:
+    - torchrun
+    - --nproc_per_node=2
+    - --nnodes=4
+    - --node_rank=2
+    - --master_addr=training-worker-0
+    - --master_port=29400
+    - train.py
+    - --checkpoint-dir=/checkpoints
+    resources:
+      limits:
+        nvidia.com/gpu: 2
+        cpu: "8"
+        memory: "64Gi"
+    volumeMounts:
+    - name: checkpoint-vol
+      mountPath: /checkpoints
+    - name: dataset-vol
+      mountPath: /data
+  volumes:
+  - name: checkpoint-vol
+    persistentVolumeClaim:
+      claimName: training-checkpoints
+  - name: dataset-vol
+    persistentVolumeClaim:
+      claimName: training-dataset
+  restartPolicy: Never
+
+---
+# Worker 3
+apiVersion: v1
+kind: Pod
+metadata:
+  name: training-worker-3
+  annotations:
+    scheduling.volcano.sh/group-name: training-gang
+  labels:
+    job-name: distributed-training
+    role: worker
+spec:
+  schedulerName: volcano
+  containers:
+  - name: trainer
+    image: pytorch-training:latest
+    command:
+    - torchrun
+    - --nproc_per_node=2
+    - --nnodes=4
+    - --node_rank=3
+    - --master_addr=training-worker-0
+    - --master_port=29400
+    - train.py
+    - --checkpoint-dir=/checkpoints
+    resources:
+      limits:
+        nvidia.com/gpu: 2
+        cpu: "8"
+        memory: "64Gi"
+    volumeMounts:
+    - name: checkpoint-vol
+      mountPath: /checkpoints
+    - name: dataset-vol
+      mountPath: /data
+  volumes:
+  - name: checkpoint-vol
+    persistentVolumeClaim:
+      claimName: training-checkpoints
+  - name: dataset-vol
+    persistentVolumeClaim:
+      claimName: training-dataset
+  restartPolicy: Never
+
+---
+# 使用 VCJob 简化上述定义（推荐方式）
+apiVersion: batch.volcano.sh/v1alpha1
+kind: Job
+metadata:
+  name: gang-training-vcjob
+spec:
+  schedulerName: volcano
+  queue: training-queue
+  minAvailable: 4            # Gang: 至少 4 个才调度
+  maxRetry: 3
+  ttlSecondsAfterFinished: 3600
+  plugins:
+    env: []                  # 自动注入 VK_TASK_INDEX
+    svc: []                  # 自动创建 DNS
+  policies:
+  - event: PodEvicted
+    action: RestartJob       # 任一 Pod 被驱逐 → 重启整个 Job
+  - event: PodFailed
+    action: RestartJob
+  tasks:
+  - replicas: 4
+    name: worker
+    policies:
+    - event: TaskCompleted
+      action: CompleteJob    # 所有 worker 完成 → Job 完成
+    template:
+      spec:
+        containers:
+        - name: trainer
+          image: pytorch-training:latest
+          command:
+          - torchrun
+          - --nproc_per_node=2
+          - --nnodes=4
+          - --node_rank=$(VK_TASK_INDEX)
+          - --master_addr=$(worker-0.gang-training-vcjob)
+          - --master_port=29400
+          - train.py
+          resources:
+            limits:
+              nvidia.com/gpu: 2
+              cpu: "8"
+              memory: "64Gi"
+        restartPolicy: OnFailure

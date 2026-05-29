@@ -1,0 +1,438 @@
+# ============================================================
+# GPU 硬件层告警规则 (SRE/Infra 响应)
+# ============================================================
+# 目标: 监控 GPU 物理健康状态、显存、温度、NVLink
+# 响应团队: SRE / Infrastructure
+# 依赖: DCGM Exporter + vLLM 内置指标
+# ============================================================
+
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: gpu-hardware-alerts
+  namespace: inference
+  labels:
+    app: vllm
+    component: gpu-hardware
+    team: sre-infra
+    prometheus: kube-prometheus
+spec:
+  groups:
+    # =========================================================
+    # Group 1: GPU 显存告警
+    # =========================================================
+    - name: gpu.memory
+      interval: 15s
+      rules:
+        # ---------------------------------------------------------
+        # GPU 显存使用率过高
+        # 场景: vLLM gpu_memory_utilization 设置过高或内存泄漏
+        # ---------------------------------------------------------
+        - alert: GPUMemoryUsageHigh
+          expr: |
+            DCGM_FI_DEV_FB_USED / (DCGM_FI_DEV_FB_USED + DCGM_FI_DEV_FB_FREE) > 0.95
+          for: 5m
+          labels:
+            severity: warning
+            team: sre-infra
+            category: gpu-memory
+          annotations:
+            summary: "GPU {{ $labels.gpu }} 显存使用率 > 95%"
+            description: |
+              实例 {{ $labels.instance }} 的 GPU {{ $labels.gpu }}
+              显存使用率达到 {{ $value | humanizePercentage }}。
+              剩余显存: {{ with printf "DCGM_FI_DEV_FB_FREE{gpu='%s',instance='%s'}" $labels.gpu $labels.instance | query }}{{ . | first | value | humanize1024 }}B{{ end }}
+              可能原因:
+              - gpu_memory_utilization 配置过高
+              - KV Cache 块数分配过多
+              - 存在显存泄漏
+            impact: "新请求可能被拒绝，OOM Kill 风险"
+            runbook_url: "https://wiki.internal/runbooks/gpu-memory-high"
+            grafana_url: "https://grafana.internal/d/vllm-overview?orgId=1"
+
+        # ---------------------------------------------------------
+        # GPU 显存即将耗尽 (Critical)
+        # ---------------------------------------------------------
+        - alert: GPUMemoryExhausted
+          expr: |
+            DCGM_FI_DEV_FB_FREE < 1024
+          for: 2m
+          labels:
+            severity: critical
+            team: sre-infra
+            category: gpu-memory
+            pager: "true"
+          annotations:
+            summary: "GPU {{ $labels.gpu }} 显存剩余 < 1GB，即将 OOM"
+            description: |
+              实例 {{ $labels.instance }} GPU {{ $labels.gpu }}
+              剩余显存仅 {{ $value | humanize1024 }}B。
+              立即行动:
+              1. 检查是否有异常大的 batch 正在处理
+              2. 考虑重启 vLLM 进程释放碎片化显存
+              3. 降低 gpu_memory_utilization 参数
+            impact: "OOM Kill 即将发生，服务中断"
+            runbook_url: "https://wiki.internal/runbooks/gpu-oom-imminent"
+
+    # =========================================================
+    # Group 2: GPU 温度与功率告警
+    # =========================================================
+    - name: gpu.thermal
+      interval: 15s
+      rules:
+        # ---------------------------------------------------------
+        # GPU 温度过高 (Warning: 80°C)
+        # H20 GPU: TDP 400W, 最高工作温度 83°C (throttle)
+        # ---------------------------------------------------------
+        - alert: GPUTemperatureHigh
+          expr: |
+            DCGM_FI_DEV_GPU_TEMP > 80
+          for: 3m
+          labels:
+            severity: warning
+            team: sre-infra
+            category: gpu-thermal
+          annotations:
+            summary: "GPU {{ $labels.gpu }} 温度 {{ $value }}°C (> 80°C)"
+            description: |
+              实例 {{ $labels.instance }} GPU {{ $labels.gpu }} 温度偏高。
+              H20 GPU 在 83°C 时会触发频率降低 (thermal throttle)。
+              检查项:
+              - 机房冷却系统是否正常
+              - 服务器风扇状态
+              - GPU 散热器是否被灰尘堵塞
+              - 相邻 GPU 温度是否也偏高 (可能是整机散热问题)
+            impact: "即将触发 thermal throttle，推理性能下降 10-30%"
+            runbook_url: "https://wiki.internal/runbooks/gpu-thermal"
+
+        # ---------------------------------------------------------
+        # GPU Thermal Throttle 已触发 (Critical)
+        # DCGM_FI_DEV_CLOCK_THROTTLE_REASONS bitmask:
+        #   bit 2 = HW Thermal Slowdown
+        #   bit 3 = SW Thermal Slowdown
+        # ---------------------------------------------------------
+        - alert: GPUThermalThrottleActive
+          expr: |
+            DCGM_FI_DEV_CLOCK_THROTTLE_REASONS > 0
+          for: 1m
+          labels:
+            severity: critical
+            team: sre-infra
+            category: gpu-thermal
+            pager: "true"
+          annotations:
+            summary: "GPU {{ $labels.gpu }} 正在被限频 (throttle)"
+            description: |
+              实例 {{ $labels.instance }} GPU {{ $labels.gpu }}
+              Clock Throttle Reasons: {{ $value }}
+              常见原因:
+              - bit 1: GPU Idle → 正常
+              - bit 2: HW Thermal Slowdown → 温度过高
+              - bit 3: SW Thermal Slowdown → 软件设置温度上限
+              - bit 4: HW Power Brake → 电源异常
+              - bit 5: SW Power Cap → 功率限制
+
+              当前性能影响:
+              - SM Clock 可能降低 20-40%
+              - 推理吞吐相应下降
+              - TTFT 和 TPOT 显著增大
+            impact: "推理性能已显著下降，影响在线服务 SLO"
+            runbook_url: "https://wiki.internal/runbooks/gpu-throttle"
+
+        # ---------------------------------------------------------
+        # GPU 功耗异常 (过低可能硬件故障, 过高可能散热问题前兆)
+        # H20 TDP = 400W
+        # ---------------------------------------------------------
+        - alert: GPUPowerAbnormal
+          expr: |
+            DCGM_FI_DEV_POWER_USAGE > 420
+              OR
+            (DCGM_FI_DEV_POWER_USAGE < 50 AND DCGM_FI_DEV_GPU_UTIL > 10)
+          for: 5m
+          labels:
+            severity: warning
+            team: sre-infra
+            category: gpu-power
+          annotations:
+            summary: "GPU {{ $labels.gpu }} 功耗异常: {{ $value }}W"
+            description: |
+              实例 {{ $labels.instance }} GPU {{ $labels.gpu }}
+              当前功耗 {{ $value }}W。
+
+              如果功耗 > 420W (超过 TDP 5%):
+              - 电源供电可能不稳定
+              - GPU 正在超频运行
+
+              如果功耗 < 50W 但 GPU 利用率 > 10%:
+              - GPU 可能处于异常低功率状态
+              - PCIe 链路可能异常
+              - 硬件故障前兆
+            runbook_url: "https://wiki.internal/runbooks/gpu-power-abnormal"
+
+    # =========================================================
+    # Group 3: GPU 硬件错误告警
+    # =========================================================
+    - name: gpu.hardware_errors
+      interval: 30s
+      rules:
+        # ---------------------------------------------------------
+        # ECC 内存错误 (Correctable) — 单比特翻转
+        # 偶尔出现正常，频繁出现说明显存老化
+        # ---------------------------------------------------------
+        - alert: GPUECCErrorsCorrectable
+          expr: |
+            increase(DCGM_FI_DEV_ECC_SBE_VOL_TOTAL[1h]) > 10
+          for: 0s
+          labels:
+            severity: warning
+            team: sre-infra
+            category: gpu-hardware
+          annotations:
+            summary: "GPU {{ $labels.gpu }} 1小时内 ECC 可纠正错误 > 10 次"
+            description: |
+              实例 {{ $labels.instance }} GPU {{ $labels.gpu }}
+              过去1小时 Single-Bit ECC 错误: {{ $value }} 次。
+
+              ECC 可纠正错误 (SBE) 说明:
+              - 偶尔出现 (< 5次/天) 是正常的宇宙射线影响
+              - 频繁出现说明 HBM3 颗粒开始老化
+              - 通常在出现不可纠正错误 (DBE) 前会有大量 SBE
+
+              建议:
+              - 记录趋势，如果持续增长需安排换卡
+              - 检查同一服务器其他 GPU 是否也有类似现象
+            runbook_url: "https://wiki.internal/runbooks/gpu-ecc-sbe"
+
+        # ---------------------------------------------------------
+        # ECC 内存错误 (Uncorrectable) — 必须立即处理
+        # 可能导致计算结果错误 (silent data corruption)
+        # ---------------------------------------------------------
+        - alert: GPUECCErrorsUncorrectable
+          expr: |
+            increase(DCGM_FI_DEV_ECC_DBE_VOL_TOTAL[5m]) > 0
+          for: 0s
+          labels:
+            severity: critical
+            team: sre-infra
+            category: gpu-hardware
+            pager: "true"
+          annotations:
+            summary: "GPU {{ $labels.gpu }} 出现不可纠正 ECC 错误 (DBE)!"
+            description: |
+              实例 {{ $labels.instance }} GPU {{ $labels.gpu }}
+              检测到 Double-Bit ECC 错误!
+
+              严重影响:
+              - 计算结果可能不正确 (silent data corruption)
+              - 模型输出可能产生乱码或异常内容
+              - 必须立即从负载均衡中摘除该 GPU
+
+              紧急操作:
+              1. 立即将该实例从流量池中移除
+              2. 运行 nvidia-smi -q 检查详细错误信息
+              3. 尝试 GPU Reset: nvidia-smi -r -i <gpu_id>
+              4. 如果重置后仍有错误，安排 RMA 换卡
+              5. 通知 ML 团队检查该 GPU 近期产出的推理结果
+            impact: "数据完整性风险，模型输出可能不可靠"
+            runbook_url: "https://wiki.internal/runbooks/gpu-ecc-dbe"
+
+        # ---------------------------------------------------------
+        # GPU XID Error — NVIDIA 驱动报告的硬件/软件错误
+        # XID 常见值: 31=GPU内存页错误, 48=DBE, 63=行重映射
+        # ---------------------------------------------------------
+        - alert: GPUXidError
+          expr: |
+            increase(DCGM_FI_DEV_XID_ERRORS[5m]) > 0
+          for: 0s
+          labels:
+            severity: critical
+            team: sre-infra
+            category: gpu-hardware
+            pager: "true"
+          annotations:
+            summary: "GPU {{ $labels.gpu }} 报告 XID Error"
+            description: |
+              实例 {{ $labels.instance }} GPU {{ $labels.gpu }}
+              XID Error 最近值: {{ $value }}
+
+              常见 XID 错误码:
+              - XID 31: GPU 内存页面错误 → 显存可能有坏块
+              - XID 43: GPU 初始化错误 → 尝试重启
+              - XID 45: Preemptive cleanup → 通常无害
+              - XID 48: Double-bit ECC → 需要换卡
+              - XID 63: Row remapping → HBM 行已被重映射
+              - XID 64: Row remapping 失败 → 必须换卡
+              - XID 79: GPU fallen off bus → PCIe 链路断开
+
+              查看详细信息: dmesg | grep -i "nvrm\|xid"
+            runbook_url: "https://wiki.internal/runbooks/gpu-xid-error"
+
+    # =========================================================
+    # Group 4: NVLink 与互联告警
+    # =========================================================
+    - name: gpu.nvlink
+      interval: 30s
+      rules:
+        # ---------------------------------------------------------
+        # NVLink 带宽异常低
+        # H20: 900 GB/s 双向 NVLink, 正常 TP=8 通信 > 100 GB/s
+        # ---------------------------------------------------------
+        - alert: NVLinkBandwidthLow
+          expr: |
+            (DCGM_FI_DEV_NVLINK_BANDWIDTH_TX_BYTES + DCGM_FI_DEV_NVLINK_BANDWIDTH_RX_BYTES)
+              < 50e9
+            AND
+            DCGM_FI_DEV_GPU_UTIL > 50
+          for: 5m
+          labels:
+            severity: warning
+            team: sre-infra
+            category: gpu-nvlink
+          annotations:
+            summary: "GPU {{ $labels.gpu }} NVLink 带宽异常低"
+            description: |
+              实例 {{ $labels.instance }} GPU {{ $labels.gpu }}
+              NVLink 双向带宽: {{ $value | humanize }}B/s
+              预期值: > 100 GB/s (H20 NVLink 最大 900 GB/s)
+
+              对 TP=8 推理的影响:
+              - All-Reduce 操作变慢
+              - TPOT 显著增大
+              - 整体吞吐下降
+
+              可能原因:
+              - NVLink 链路部分降级
+              - NVSwitch 故障
+              - GPU 拓扑配置错误
+
+              诊断命令:
+              - nvidia-smi nvlink -s (查看链路状态)
+              - nvidia-smi topo -m (查看拓扑)
+            runbook_url: "https://wiki.internal/runbooks/nvlink-bandwidth-low"
+
+        # ---------------------------------------------------------
+        # NVLink CRC 错误 — 链路质量问题
+        # ---------------------------------------------------------
+        - alert: NVLinkCRCErrors
+          expr: |
+            increase(DCGM_FI_DEV_NVLINK_CRC_FLIT_ERROR_COUNT_TOTAL[1h]) > 100
+          for: 0s
+          labels:
+            severity: warning
+            team: sre-infra
+            category: gpu-nvlink
+          annotations:
+            summary: "GPU {{ $labels.gpu }} NVLink CRC 错误频繁"
+            description: |
+              实例 {{ $labels.instance }} GPU {{ $labels.gpu }}
+              过去1小时 NVLink CRC 错误: {{ $value }} 次。
+
+              CRC 错误说明 NVLink 物理链路质量下降:
+              - 可能是线缆接触不良
+              - NVSwitch 端口问题
+              - 电磁干扰
+
+              虽然 NVLink 有自动重传机制不会丢数据，
+              但频繁重传会降低有效带宽。
+            runbook_url: "https://wiki.internal/runbooks/nvlink-crc-errors"
+
+    # =========================================================
+    # Group 5: GPU 可用性告警
+    # =========================================================
+    - name: gpu.availability
+      interval: 15s
+      rules:
+        # ---------------------------------------------------------
+        # GPU 掉线 (DCGM Exporter 无法采集)
+        # ---------------------------------------------------------
+        - alert: GPUNotResponding
+          expr: |
+            up{job="dcgm-exporter"} == 0
+          for: 2m
+          labels:
+            severity: critical
+            team: sre-infra
+            category: gpu-availability
+            pager: "true"
+          annotations:
+            summary: "DCGM Exporter {{ $labels.instance }} 无响应"
+            description: |
+              DCGM Exporter 实例 {{ $labels.instance }} 连续2分钟无法采集。
+
+              可能原因:
+              - DCGM Exporter Pod 崩溃
+              - GPU 驱动崩溃 (GPU fallen off bus)
+              - 节点网络问题
+              - 节点本身宕机
+
+              诊断步骤:
+              1. kubectl get pods -l app=dcgm-exporter -n monitoring
+              2. ssh 到节点检查 nvidia-smi 是否正常
+              3. 检查 dmesg 是否有 GPU/PCIe 错误
+              4. 检查节点 kubelet 状态
+            impact: "该节点 GPU 监控完全失效，无法感知硬件问题"
+            runbook_url: "https://wiki.internal/runbooks/dcgm-exporter-down"
+
+        # ---------------------------------------------------------
+        # GPU 利用率长期为 0 (可能 GPU 被隔离或异常)
+        # ---------------------------------------------------------
+        - alert: GPUIdleButAllocated
+          expr: |
+            DCGM_FI_DEV_GPU_UTIL == 0
+            AND
+            ON(instance) vllm:num_requests_running > 0
+          for: 10m
+          labels:
+            severity: warning
+            team: sre-infra
+            category: gpu-availability
+          annotations:
+            summary: "GPU {{ $labels.gpu }} 利用率为0但有活跃请求"
+            description: |
+              实例 {{ $labels.instance }} GPU {{ $labels.gpu }}
+              GPU 利用率持续为0，但 vLLM 显示有正在运行的请求。
+
+              可能原因:
+              - GPU 挂起 (hung) 状态
+              - CUDA Context 异常
+              - vLLM Worker 进程与 GPU 通信中断
+              - TP 组中某个 Worker 卡住导致整组阻塞
+
+              紧急操作:
+              1. 检查 vLLM 日志是否有 CUDA Error
+              2. 尝试 nvidia-smi -r 重置 GPU
+              3. 如果无效，重启 vLLM 服务
+            impact: "GPU 资源浪费，且可能阻塞整个 TP 组"
+            runbook_url: "https://wiki.internal/runbooks/gpu-idle-allocated"
+
+        # ---------------------------------------------------------
+        # SM Clock 异常低 (可能被限频或降级)
+        # H20 Boost Clock: ~1980 MHz, 正常负载应 > 1500 MHz
+        # ---------------------------------------------------------
+        - alert: GPUClockAbnormallyLow
+          expr: |
+            DCGM_FI_DEV_SM_CLOCK < 1000
+            AND
+            DCGM_FI_DEV_GPU_UTIL > 50
+          for: 5m
+          labels:
+            severity: warning
+            team: sre-infra
+            category: gpu-performance
+          annotations:
+            summary: "GPU {{ $labels.gpu }} SM Clock 异常低: {{ $value }} MHz"
+            description: |
+              实例 {{ $labels.instance }} GPU {{ $labels.gpu }}
+              SM Clock: {{ $value }} MHz (预期 > 1500 MHz)
+              GPU 利用率 > 50% 但时钟频率远低于正常值。
+
+              可能原因:
+              - Power Cap 设置过低 (nvidia-smi -pl)
+              - Thermal Throttle (检查温度)
+              - GPU 已被降级运行
+              - 电源供应不足
+
+              诊断:
+              - nvidia-smi -q -d CLOCK,POWER (查看详细时钟和功率)
+              - nvidia-smi -q -d PERFORMANCE (查看性能状态)
+            runbook_url: "https://wiki.internal/runbooks/gpu-clock-low"

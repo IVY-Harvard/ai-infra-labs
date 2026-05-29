@@ -1,0 +1,37 @@
+# 8×H20 GPU 配置: TP=4, PP=2, DP=1
+# 适用于 7B-13B 模型训练
+
+parallel:
+  tensor_parallel_size: 4      # NVLink 组内
+  pipeline_parallel_size: 2    # 2 个 stage
+  data_parallel_size: 1        # 8 / (4*2) = 1
+
+model:
+  hidden_size: 4096
+  num_layers: 32
+  num_heads: 32
+  ffn_size: 16384              # 4 * hidden_size (SwiGLU 可设为 14336)
+  vocab_size: 32000
+  max_seq_len: 2048
+
+training:
+  micro_batch_size: 2
+  num_micro_batches: 8         # global batch = 2 * 8 * 1 = 16
+  learning_rate: 3.0e-4
+  min_lr: 3.0e-5
+  warmup_steps: 200
+  max_steps: 10000
+  precision: bf16
+  gradient_clipping: 1.0
+  weight_decay: 0.01
+
+checkpoint:
+  save_interval: 500
+  save_dir: ./checkpoints
+  max_keep: 3
+  async_save: true
+
+logging:
+  log_interval: 10
+  wandb_project: null          # 设为项目名以启用 wandb
+  tensorboard_dir: ./tb_logs

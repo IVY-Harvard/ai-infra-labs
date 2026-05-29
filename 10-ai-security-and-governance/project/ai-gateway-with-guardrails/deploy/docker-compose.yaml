@@ -1,0 +1,27 @@
+version: "3.9"
+
+services:
+  ai-gateway:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - UPSTREAM_URL=http://model-server:8080/v1
+      - API_KEY_SECRET=change-me-in-production
+      - RATE_LIMIT_RPM=60
+      - LOG_LEVEL=INFO
+    depends_on:
+      - redis
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+
+volumes:
+  redis-data:

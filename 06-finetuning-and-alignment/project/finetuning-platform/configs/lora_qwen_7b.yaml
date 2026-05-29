@@ -1,0 +1,62 @@
+# Qwen2-7B LoRA 微调配置
+experiment:
+  name: qwen2-7b-lora-sft
+  description: "Qwen2-7B LoRA SFT 微调"
+
+model:
+  name: "Qwen/Qwen2-7B"
+  revision: "main"
+  torch_dtype: "bfloat16"
+
+method:
+  type: "lora"
+  lora:
+    r: 64
+    alpha: 128
+    target_modules:
+      - q_proj
+      - k_proj
+      - v_proj
+      - o_proj
+      - gate_proj
+      - up_proj
+      - down_proj
+    dropout: 0.05
+    bias: "none"
+    use_dora: false
+  qlora:
+    enabled: false
+
+data:
+  train_file: "data/train.jsonl"
+  eval_file: "data/eval.jsonl"
+  format: "messages"
+  max_seq_length: 2048
+
+training:
+  num_epochs: 3
+  batch_size: 4
+  gradient_accumulation: 4
+  learning_rate: 2.0e-4
+  lr_scheduler: "cosine"
+  warmup_ratio: 0.03
+  weight_decay: 0.01
+  bf16: true
+  gradient_checkpointing: true
+
+distributed:
+  num_gpus: 1
+  strategy: "auto"
+
+evaluation:
+  benchmarks:
+    - mmlu
+    - ceval
+  eval_steps: 500
+  quality_threshold: 0.6
+
+output:
+  dir: "outputs/qwen2-7b-lora"
+  save_steps: 500
+  save_total_limit: 3
+  logging_steps: 10

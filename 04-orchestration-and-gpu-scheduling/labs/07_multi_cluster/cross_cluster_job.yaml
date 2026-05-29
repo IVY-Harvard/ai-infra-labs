@@ -1,0 +1,147 @@
+# 跨集群 GPU Job 调度示例
+#
+# 使用 Karmada 实现跨集群 GPU 训练任务分发。
+# 场景：私有集群 GPU 不足，自动 burst 到云上。
+
+---
+# 1. 注册成员集群
+# karmadactl join cluster-onprem --cluster-kubeconfig=/path/to/onprem.kubeconfig
+# karmadactl join cluster-cloud --cluster-kubeconfig=/path/to/cloud.kubeconfig
+
+---
+# 2. 定义 GPU 训练 Job（在 Karmada Control Plane 提交）
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: cross-cluster-training
+  namespace: ml-training
+spec:
+  parallelism: 4
+  completions: 4
+  template:
+    spec:
+      containers:
+      - name: trainer
+        image: registry.example.com/pytorch-training:latest
+        command:
+        - torchrun
+        - --nproc_per_node=2
+        - --nnodes=4
+        - --node_rank=$(JOB_COMPLETION_INDEX)
+        - --master_addr=training-master.ml-training.svc
+        - --master_port=29400
+        - train.py
+        resources:
+          limits:
+            nvidia.com/gpu: 2
+            cpu: "8"
+            memory: "64Gi"
+      restartPolicy: Never
+
+---
+# 3. 分发策略：优先私有集群，不够时 burst 到云
+apiVersion: policy.karmada.io/v1alpha1
+kind: PropagationPolicy
+metadata:
+  name: gpu-training-propagation
+  namespace: ml-training
+spec:
+  resourceSelectors:
+  - apiVersion: batch/v1
+    kind: Job
+    name: cross-cluster-training
+  placement:
+    clusterAffinity:
+      clusterNames:
+      - cluster-onprem      # 私有 H20 集群
+      - cluster-cloud       # 云 GPU 集群
+    replicaScheduling:
+      replicaDivisionPreference: Weighted
+      replicaSchedulingType: Divided
+      weightPreference:
+        dynamicWeight: AvailableReplicas   # 根据实际可用资源分配
+    spreadConstraints:
+    - maxGroups: 2                          # 最多分布在 2 个集群
+      minGroups: 1
+
+---
+# 4. 覆盖策略：为不同集群调整配置
+apiVersion: policy.karmada.io/v1alpha1
+kind: OverridePolicy
+metadata:
+  name: cloud-cluster-override
+  namespace: ml-training
+spec:
+  resourceSelectors:
+  - apiVersion: batch/v1
+    kind: Job
+    name: cross-cluster-training
+  overrideRules:
+  - targetCluster:
+      clusterNames:
+      - cluster-cloud
+    overriders:
+      # 云集群使用不同的镜像仓库
+      imageOverrider:
+      - component: Registry
+        operator: replace
+        value: gcr.io/my-project
+      # 云集群添加 Spot 实例容忍
+      plaintext:
+      - path: "/spec/template/spec/tolerations"
+        operator: add
+        value:
+        - key: "cloud.google.com/gke-spot"
+          operator: "Equal"
+          value: "true"
+          effect: "NoSchedule"
+
+---
+# 5. 资源解释器：让 Karmada 理解 GPU 资源
+apiVersion: config.karmada.io/v1alpha1
+kind: ResourceInterpreterCustomization
+metadata:
+  name: gpu-job-interpreter
+spec:
+  target:
+    apiVersion: batch/v1
+    kind: Job
+  customizations:
+    replicaResource:
+      luaScript: >
+        local obj = decodeObj(objStr)
+        local replica = obj.spec.parallelism or 1
+        local gpuPerReplica = 0
+        for _, container in pairs(obj.spec.template.spec.containers) do
+          if container.resources and container.resources.limits then
+            local gpu = container.resources.limits["nvidia.com/gpu"]
+            if gpu then
+              gpuPerReplica = gpuPerReplica + tonumber(gpu)
+            end
+          end
+        end
+        return replica, {
+          ["nvidia.com/gpu"] = gpuPerReplica,
+          ["cpu"] = "8",
+          ["memory"] = "64Gi"
+        }
+    replicaRevision:
+      luaScript: >
+        local obj = decodeObj(objStr)
+        obj.spec.parallelism = replica
+        obj.spec.completions = replica
+        return encodeObj(obj)
+
+---
+# 6. 监控跨集群 Job 状态
+#
+# karmadactl get job cross-cluster-training -n ml-training
+# CLUSTER          NAME                    COMPLETIONS   DURATION
+# cluster-onprem   cross-cluster-training  2/2           45m
+# cluster-cloud    cross-cluster-training  2/2           48m
+#
+# 注意：跨集群分布式训练需要集群间网络互通（VPN/专线），
+# 否则 NCCL 通信会失败。实际场景中通常是：
+#   - 每个集群内部做数据并行
+#   - 集群间做模型并行或 Pipeline 并行
+#   - 或者完全独立的训练任务分发到不同集群

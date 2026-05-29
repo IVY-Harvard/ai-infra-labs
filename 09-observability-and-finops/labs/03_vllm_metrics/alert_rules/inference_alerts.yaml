@@ -1,0 +1,595 @@
+# ============================================================
+# 推理服务层告警规则 (ML Platform 响应)
+# ============================================================
+# 目标: 监控 vLLM 推理服务性能、延迟 SLO、吞吐、KV Cache
+# 响应团队: ML Platform / MLOps
+# 依赖: vLLM 内置 Prometheus 指标
+# ============================================================
+
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: inference-service-alerts
+  namespace: inference
+  labels:
+    app: vllm
+    component: inference-service
+    team: ml-platform
+    prometheus: kube-prometheus
+spec:
+  groups:
+    # =========================================================
+    # Group 1: 延迟 SLO 告警
+    # =========================================================
+    - name: inference.latency
+      interval: 15s
+      rules:
+        # ---------------------------------------------------------
+        # TTFT P99 超过 SLO 阈值
+        # SLO 定义: TTFT P99 < 5s (普通请求)
+        # ---------------------------------------------------------
+        - alert: TTFTp99ExceedsSLO
+          expr: |
+            histogram_quantile(0.99,
+              sum by (le, instance) (
+                rate(vllm:time_to_first_token_seconds_bucket[5m])
+              )
+            ) > 5
+          for: 3m
+          labels:
+            severity: warning
+            team: ml-platform
+            category: latency-slo
+            slo: ttft-p99
+          annotations:
+            summary: "TTFT P99 = {{ $value | humanizeDuration }} > 5s SLO"
+            description: |
+              实例 {{ $labels.instance }} TTFT P99 超过 SLO 阈值。
+
+              当前值: {{ $value | humanizeDuration }}
+              SLO 目标: < 5s
+
+              常见原因 (按排查优先级):
+              1. KV Cache 使用率 > 90% → 排队/抢占导致
+              2. num_requests_waiting > 0 → 调度积压
+              3. 突发大量长 prompt 请求
+              4. Prefix Cache 命中率下降
+
+              优化方向:
+              - 增加 gpu_memory_utilization 分配更多 KV Cache
+              - 开启/优化 prefix caching
+              - 限制单请求最大 prompt 长度
+              - 水平扩容增加实例
+            impact: "用户首字等待时间过长，影响交互体验"
+            runbook_url: "https://wiki.internal/runbooks/ttft-slo-breach"
+            grafana_url: "https://grafana.internal/d/vllm-latency"
+
+        # ---------------------------------------------------------
+        # TTFT P99 严重超标 (Critical)
+        # ---------------------------------------------------------
+        - alert: TTFTp99Critical
+          expr: |
+            histogram_quantile(0.99,
+              sum by (le, instance) (
+                rate(vllm:time_to_first_token_seconds_bucket[5m])
+              )
+            ) > 10
+          for: 2m
+          labels:
+            severity: critical
+            team: ml-platform
+            category: latency-slo
+            slo: ttft-p99
+            pager: "true"
+          annotations:
+            summary: "TTFT P99 = {{ $value | humanizeDuration }} > 10s (Critical)"
+            description: |
+              实例 {{ $labels.instance }} TTFT P99 严重超标!
+              用户等待首字 > 10 秒，体验极差。
+
+              紧急措施:
+              1. 检查 gpu_cache_usage_perc — 如果 > 0.95 考虑限流
+              2. 检查 num_requests_waiting — 如果 > 50 触发扩容
+              3. 检查是否有异常长的 prompt (> 16K tokens)
+              4. 考虑临时降低 max_num_seqs 减少并发
+            impact: "服务基本不可用，用户大量流失"
+            runbook_url: "https://wiki.internal/runbooks/ttft-critical"
+
+        # ---------------------------------------------------------
+        # TPOT P99 过高 — Streaming 体验差
+        # SLO: TPOT P99 < 80ms (流畅 streaming)
+        # ---------------------------------------------------------
+        - alert: TPOTp99ExceedsSLO
+          expr: |
+            histogram_quantile(0.99,
+              sum by (le, instance) (
+                rate(vllm:time_per_output_token_seconds_bucket[5m])
+              )
+            ) > 0.08
+          for: 3m
+          labels:
+            severity: warning
+            team: ml-platform
+            category: latency-slo
+            slo: tpot-p99
+          annotations:
+            summary: "TPOT P99 = {{ $value | humanizeDuration }} > 80ms SLO"
+            description: |
+              实例 {{ $labels.instance }} Token 间延迟过高。
+
+              当前值: {{ $value | humanizeDuration }}
+              SLO 目标: < 80ms
+              用户感受: > 60ms 开始感觉明显卡顿
+
+              常见原因:
+              1. Decode Batch 过大 → 降低 max_num_seqs
+              2. NVLink 带宽瓶颈 → 检查 TP 通信
+              3. GPU 被限频 → 检查温度/功率
+              4. 其他进程争抢 GPU 资源
+
+              TPOT 与 Batch Size 关系:
+              - Batch 1-32: TPOT ≈ 15-30ms (H20 + Qwen2.5-72B)
+              - Batch 32-128: TPOT ≈ 30-60ms
+              - Batch 128+: TPOT ≈ 60-100ms
+            impact: "Streaming 输出卡顿，用户体验降级"
+            runbook_url: "https://wiki.internal/runbooks/tpot-slo-breach"
+
+        # ---------------------------------------------------------
+        # TPOT P99 Critical — 严重卡顿
+        # ---------------------------------------------------------
+        - alert: TPOTp99Critical
+          expr: |
+            histogram_quantile(0.99,
+              sum by (le, instance) (
+                rate(vllm:time_per_output_token_seconds_bucket[5m])
+              )
+            ) > 0.15
+          for: 2m
+          labels:
+            severity: critical
+            team: ml-platform
+            category: latency-slo
+            slo: tpot-p99
+            pager: "true"
+          annotations:
+            summary: "TPOT P99 = {{ $value | humanizeDuration }} > 150ms (Critical)"
+            description: |
+              Token 生成严重卡顿!
+
+              紧急措施:
+              1. 立即检查 GPU 是否有 throttle
+              2. 降低 max_num_seqs 减小 batch size
+              3. 如有多实例，将流量转移到健康实例
+              4. 检查 NVLink 通信是否正常
+            impact: "Streaming 输出几乎停滞"
+            runbook_url: "https://wiki.internal/runbooks/tpot-critical"
+
+        # ---------------------------------------------------------
+        # E2E Latency P99 异常
+        # ---------------------------------------------------------
+        - alert: E2ELatencyP99High
+          expr: |
+            histogram_quantile(0.99,
+              sum by (le, instance) (
+                rate(vllm:e2e_request_latency_seconds_bucket[5m])
+              )
+            ) > 60
+          for: 5m
+          labels:
+            severity: warning
+            team: ml-platform
+            category: latency-slo
+          annotations:
+            summary: "E2E Latency P99 > 60s"
+            description: |
+              端到端请求延迟 P99 超过 60 秒。
+              注意: E2E = Queue + TTFT + (output_len × TPOT)
+
+              需要分解确认瓶颈:
+              - 如果 TTFT 正常但 E2E 高 → output 太长或 TPOT 太慢
+              - 如果 TTFT 也高 → 排队/KV Cache 问题
+            runbook_url: "https://wiki.internal/runbooks/e2e-latency-high"
+
+    # =========================================================
+    # Group 2: 吞吐量告警
+    # =========================================================
+    - name: inference.throughput
+      interval: 15s
+      rules:
+        # ---------------------------------------------------------
+        # 生成吞吐骤降
+        # 正常基线: 800-2000 tokens/s (8×H20 + Qwen2.5-72B)
+        # ---------------------------------------------------------
+        - alert: GenerationThroughputDrop
+          expr: |
+            rate(vllm:generation_tokens_total[5m]) < 100
+            AND
+            vllm:num_requests_running > 0
+          for: 3m
+          labels:
+            severity: warning
+            team: ml-platform
+            category: throughput
+          annotations:
+            summary: "生成吞吐 < 100 tokens/s 但有活跃请求"
+            description: |
+              实例 {{ $labels.instance }}
+              当前吞吐: {{ $value | humanize }} tokens/s
+              活跃请求: > 0
+
+              吞吐骤降可能原因:
+              1. GPU 被限频 (thermal/power throttle)
+              2. vLLM Worker 卡住 (deadlock)
+              3. NVLink 通信异常 (TP 组阻塞)
+              4. CUDA Error 导致重试循环
+              5. 大量请求同时完成，瞬时无新请求
+
+              如果持续 > 5 分钟需要告警升级。
+            runbook_url: "https://wiki.internal/runbooks/throughput-drop"
+
+        # ---------------------------------------------------------
+        # 吞吐完全归零 — 服务可能挂了
+        # ---------------------------------------------------------
+        - alert: GenerationThroughputZero
+          expr: |
+            rate(vllm:generation_tokens_total[1m]) == 0
+            AND
+            vllm:num_requests_waiting > 0
+          for: 30s
+          labels:
+            severity: critical
+            team: ml-platform
+            category: throughput
+            pager: "true"
+          annotations:
+            summary: "吞吐为 0 但有排队请求 — 服务可能停滞!"
+            description: |
+              实例 {{ $labels.instance }}
+              生成吞吐 = 0 tokens/s
+              排队请求 > 0
+
+              这通常意味着:
+              - vLLM 推理引擎挂起 (hung)
+              - GPU 出现不可恢复错误
+              - 死锁 (TP Worker 间通信超时)
+
+              紧急措施:
+              1. 检查 vLLM 进程是否存活: kubectl get pods
+              2. 检查 GPU 状态: nvidia-smi
+              3. 查看日志: kubectl logs <pod> --tail=100
+              4. 如果无响应，执行滚动重启
+            impact: "服务完全停止响应，所有请求超时"
+            runbook_url: "https://wiki.internal/runbooks/throughput-zero"
+
+        # ---------------------------------------------------------
+        # 请求失败率过高
+        # ---------------------------------------------------------
+        - alert: RequestFailureRateHigh
+          expr: |
+            rate(vllm:request_failure_total[5m])
+              / (rate(vllm:request_success_total[5m]) + rate(vllm:request_failure_total[5m]))
+            > 0.01
+          for: 3m
+          labels:
+            severity: warning
+            team: ml-platform
+            category: error-rate
+          annotations:
+            summary: "请求失败率 > 1%: {{ $value | humanizePercentage }}"
+            description: |
+              实例 {{ $labels.instance }}
+              错误率: {{ $value | humanizePercentage }}
+
+              常见失败原因:
+              - 请求超时 (client timeout < E2E latency)
+              - Input 长度超过 max_model_len
+              - GPU OOM (显存耗尽)
+              - 采样参数非法 (temperature=0 + top_p<1)
+
+              检查错误类型分布:
+              - rate(vllm:request_failure_total[5m]) by (reason)
+            runbook_url: "https://wiki.internal/runbooks/request-failure-rate"
+
+        # ---------------------------------------------------------
+        # 请求失败率严重
+        # ---------------------------------------------------------
+        - alert: RequestFailureRateCritical
+          expr: |
+            rate(vllm:request_failure_total[5m])
+              / (rate(vllm:request_success_total[5m]) + rate(vllm:request_failure_total[5m]))
+            > 0.05
+          for: 2m
+          labels:
+            severity: critical
+            team: ml-platform
+            category: error-rate
+            pager: "true"
+          annotations:
+            summary: "请求失败率 > 5%: {{ $value | humanizePercentage }}"
+            description: |
+              服务错误率严重超标!
+              可能需要限流或摘除该实例。
+            impact: "大量请求失败，用户体验严重受损"
+            runbook_url: "https://wiki.internal/runbooks/request-failure-critical"
+
+    # =========================================================
+    # Group 3: KV Cache 与调度告警
+    # =========================================================
+    - name: inference.kv_cache
+      interval: 15s
+      rules:
+        # ---------------------------------------------------------
+        # KV Cache 使用率高 (Warning)
+        # ---------------------------------------------------------
+        - alert: KVCacheUsageHigh
+          expr: |
+            vllm:gpu_cache_usage_perc > 0.9
+          for: 5m
+          labels:
+            severity: warning
+            team: ml-platform
+            category: kv-cache
+          annotations:
+            summary: "KV Cache 使用率 {{ $value | humanizePercentage }} > 90%"
+            description: |
+              实例 {{ $labels.instance }}
+              KV Cache GPU 使用率: {{ $value | humanizePercentage }}
+
+              影响链:
+              gpu_cache_usage > 0.9
+                → 新请求可能无法获得足够 KV blocks
+                → 触发 Preemption (抢占旧请求释放空间)
+                → 被抢占请求 TTFT 重新计时
+                → 整体 P99 延迟飙升
+
+              优化方向:
+              1. 增大 gpu_memory_utilization (如 0.9 → 0.95)
+              2. 减小 max_model_len (如 32768 → 16384)
+              3. 开启 prefix caching 复用 KV
+              4. 水平扩容分散负载
+              5. 限制单请求最大 context 长度
+            runbook_url: "https://wiki.internal/runbooks/kv-cache-high"
+            grafana_url: "https://grafana.internal/d/vllm-kv-cache"
+
+        # ---------------------------------------------------------
+        # KV Cache 即将满 (Critical)
+        # ---------------------------------------------------------
+        - alert: KVCacheNearlyFull
+          expr: |
+            vllm:gpu_cache_usage_perc > 0.95
+          for: 2m
+          labels:
+            severity: critical
+            team: ml-platform
+            category: kv-cache
+            pager: "true"
+          annotations:
+            summary: "KV Cache 使用率 {{ $value | humanizePercentage }} > 95% (Critical)"
+            description: |
+              KV Cache 即将耗尽! 服务性能严重下降。
+              Preemption 频率极高，新请求几乎无法被调度。
+
+              紧急措施:
+              1. 对入口流量限流 (rate limiting)
+              2. 如有备用实例，立即分流
+              3. 临时降低 max_num_seqs 减少并发
+              4. 考虑拒绝过长的新 prompt (> 8K tokens)
+            impact: "服务性能严重降级，接近不可用"
+            runbook_url: "https://wiki.internal/runbooks/kv-cache-critical"
+
+        # ---------------------------------------------------------
+        # Preemption 频繁发生
+        # ---------------------------------------------------------
+        - alert: PreemptionRateHigh
+          expr: |
+            rate(vllm:num_preemptions_total[5m]) > 1
+          for: 3m
+          labels:
+            severity: warning
+            team: ml-platform
+            category: kv-cache
+          annotations:
+            summary: "Preemption 速率 > 1/s: {{ $value | humanize }}/s"
+            description: |
+              实例 {{ $labels.instance }}
+              Preemption 速率: {{ $value | humanize }} 次/秒
+
+              Preemption = KV Cache 满 → 暂停/驱逐某些请求
+
+              直接影响:
+              - 被抢占请求的 KV 需要 recompute 或从 CPU swap 回来
+              - 该请求 TTFT 重新计时 (用户再次等待)
+              - 整体吞吐下降 (GPU 做重复 Prefill 计算)
+
+              关联检查:
+              - vllm:gpu_cache_usage_perc → 应该 > 0.9
+              - vllm:num_requests_swapped → 如果 > 0 说明在做 CPU offload
+            runbook_url: "https://wiki.internal/runbooks/preemption-high"
+
+        # ---------------------------------------------------------
+        # CPU Swap 发生 — 性能严重下降
+        # ---------------------------------------------------------
+        - alert: KVCacheSwapActive
+          expr: |
+            vllm:cpu_cache_usage_perc > 0
+          for: 5m
+          labels:
+            severity: warning
+            team: ml-platform
+            category: kv-cache
+          annotations:
+            summary: "KV Cache CPU Swap 激活: {{ $value | humanizePercentage }}"
+            description: |
+              实例 {{ $labels.instance }}
+              CPU KV Cache 使用率: {{ $value | humanizePercentage }}
+
+              CPU Swap > 0 意味着:
+              - GPU 显存完全不够用
+              - 部分请求的 KV 被 swap 到 CPU 内存
+              - PCIe 带宽成为瓶颈 (H20: PCIe Gen5 x16 ≈ 64 GB/s)
+              - 每次 swap-in 增加 10-50ms 延迟
+
+              这是严重的性能退化信号，通常意味着需要扩容。
+            impact: "KV Cache 在 GPU/CPU 间颠簸，性能退化 30-50%"
+            runbook_url: "https://wiki.internal/runbooks/kv-cache-swap"
+
+        # ---------------------------------------------------------
+        # 排队请求过多
+        # ---------------------------------------------------------
+        - alert: RequestQueueBacklog
+          expr: |
+            vllm:num_requests_waiting > 10
+          for: 1m
+          labels:
+            severity: warning
+            team: ml-platform
+            category: scheduling
+          annotations:
+            summary: "排队请求 {{ $value }} > 10"
+            description: |
+              实例 {{ $labels.instance }}
+              当前排队: {{ $value }} 个请求
+
+              排队原因:
+              - KV Cache 不够分配新请求 → 检查 gpu_cache_usage_perc
+              - 已达 max_num_seqs 上限 → 考虑增大
+              - 请求到达速率 > 处理速率 → 需要扩容
+
+              预计等待时间 ≈ waiting / (throughput / avg_output_len)
+            runbook_url: "https://wiki.internal/runbooks/request-queue"
+
+        # ---------------------------------------------------------
+        # 排队严重 (Critical)
+        # ---------------------------------------------------------
+        - alert: RequestQueueCritical
+          expr: |
+            vllm:num_requests_waiting > 50
+          for: 1m
+          labels:
+            severity: critical
+            team: ml-platform
+            category: scheduling
+            pager: "true"
+          annotations:
+            summary: "排队请求 {{ $value }} > 50 — 需要立即扩容!"
+            description: |
+              严重排队! {{ $value }} 个请求在等待。
+              预计新请求等待时间 > 30s。
+
+              紧急措施:
+              1. 触发 HPA 扩容 (如有配置)
+              2. 对非关键业务限流
+              3. 启用降级策略 (如限制 max_tokens)
+              4. 检查是否有实例挂了导致流量集中
+            impact: "大量用户等待超时，服务容量严重不足"
+            runbook_url: "https://wiki.internal/runbooks/request-queue-critical"
+
+    # =========================================================
+    # Group 4: Prefix Cache 效率告警
+    # =========================================================
+    - name: inference.prefix_cache
+      interval: 30s
+      rules:
+        # ---------------------------------------------------------
+        # Prefix Cache 命中率骤降
+        # 场景: System Prompt 变更、Cache 被频繁淘汰
+        # ---------------------------------------------------------
+        - alert: PrefixCacheHitRateDrop
+          expr: |
+            vllm:prefix_cache_hit_rate < 0.5
+            AND
+            vllm:prefix_cache_hit_rate offset 1h > 0.8
+          for: 10m
+          labels:
+            severity: warning
+            team: ml-platform
+            category: prefix-cache
+          annotations:
+            summary: "Prefix Cache 命中率从 > 80% 骤降至 {{ $value | humanizePercentage }}"
+            description: |
+              实例 {{ $labels.instance }}
+              当前命中率: {{ $value | humanizePercentage }}
+              1小时前: > 80%
+
+              可能原因:
+              - System Prompt 发生变更 (所有 cache 失效)
+              - 流量模式变化 (新类型的请求涌入)
+              - KV Cache 压力导致 prefix blocks 被淘汰
+              - vLLM 重启导致 cache 清空
+
+              影响:
+              - TTFT 可能增加 40-60%
+              - GPU 计算负载增加 (重复 Prefill)
+              - 有效容量下降
+
+              建议:
+              - 确认 system prompt 是否有变更
+              - 检查 gpu_cache_usage_perc 是否过高导致淘汰
+              - 考虑增大 prefix cache 预留空间
+            runbook_url: "https://wiki.internal/runbooks/prefix-cache-drop"
+
+    # =========================================================
+    # Group 5: 服务可用性告警
+    # =========================================================
+    - name: inference.availability
+      interval: 15s
+      rules:
+        # ---------------------------------------------------------
+        # vLLM 服务不可达
+        # ---------------------------------------------------------
+        - alert: VLLMServiceDown
+          expr: |
+            up{job=~"vllm.*"} == 0
+          for: 30s
+          labels:
+            severity: critical
+            team: ml-platform
+            category: availability
+            pager: "true"
+          annotations:
+            summary: "vLLM 实例 {{ $labels.instance }} 不可达!"
+            description: |
+              vLLM 服务 {{ $labels.instance }} 连续 30 秒无法采集指标。
+
+              可能原因:
+              - vLLM 进程崩溃 (OOM Kill / CUDA Error)
+              - Pod 被驱逐 (Node Pressure)
+              - 健康检查失败导致 Pod 重启中
+
+              诊断:
+              1. kubectl get pods -l app=vllm
+              2. kubectl describe pod <pod-name>
+              3. kubectl logs <pod-name> --previous (查看崩溃前日志)
+              4. 检查 Node 事件: kubectl get events --field-selector reason=Killing
+            impact: "该实例完全不可用，流量需要切换到其他实例"
+            runbook_url: "https://wiki.internal/runbooks/vllm-service-down"
+
+        # ---------------------------------------------------------
+        # vLLM 模型加载失败 / 启动超时
+        # ---------------------------------------------------------
+        - alert: VLLMModelLoadSlow
+          expr: |
+            time() - kube_pod_start_time{pod=~"vllm.*"} > 600
+            AND
+            kube_pod_status_ready{pod=~"vllm.*"} == 0
+          for: 1m
+          labels:
+            severity: warning
+            team: ml-platform
+            category: availability
+          annotations:
+            summary: "vLLM Pod 启动 > 10分钟仍未 Ready"
+            description: |
+              Pod {{ $labels.pod }} 启动已超过 10 分钟但仍未就绪。
+
+              Qwen2.5-72B (TP=8) 正常加载时间:
+              - 从本地 NVMe: 2-3 分钟
+              - 从 NFS/S3: 5-8 分钟
+              - 超过 10 分钟: 异常
+
+              可能原因:
+              - 模型文件下载中断
+              - GPU 显存不足无法加载模型
+              - NCCL 初始化失败 (TP 通信问题)
+              - 磁盘 I/O 瓶颈
+            runbook_url: "https://wiki.internal/runbooks/vllm-model-load-slow"

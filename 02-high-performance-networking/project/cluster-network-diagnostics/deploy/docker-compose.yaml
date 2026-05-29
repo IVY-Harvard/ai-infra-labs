@@ -1,0 +1,96 @@
+version: '3.8'
+
+# 集群网络诊断平台 Docker Compose 配置
+# 包含诊断Agent、Prometheus监控和Grafana可视化
+
+services:
+  # 诊断Agent - 核心诊断服务
+  diag-agent:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    container_name: cluster-diag-agent
+    hostname: diag-agent
+    restart: unless-stopped
+    privileged: true  # 需要特权模式访问IB设备
+    network_mode: host  # 使用主机网络直接访问IB网卡
+    volumes:
+      - ../config.yaml:/app/config.yaml:ro
+      - diag-data:/var/lib/cluster-diag
+      - /sys/class/infiniband:/sys/class/infiniband:ro
+      - /dev/infiniband:/dev/infiniband:ro
+      - ~/.ssh:/root/.ssh:ro  # SSH密钥用于远程节点访问
+    environment:
+      - DIAG_CONFIG_PATH=/app/config.yaml
+      - DIAG_LOG_LEVEL=INFO
+      - DIAG_DATA_DIR=/var/lib/cluster-diag
+      - PROMETHEUS_PUSHGATEWAY=http://pushgateway:9091
+    depends_on:
+      - pushgateway
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Prometheus - 时序数据存储
+  prometheus:
+    image: prom/prometheus:v2.48.0
+    container_name: cluster-diag-prometheus
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/rules:/etc/prometheus/rules:ro
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=30d'
+      - '--web.enable-lifecycle'
+
+  # Prometheus Pushgateway - 接收诊断Agent推送的指标
+  pushgateway:
+    image: prom/pushgateway:v1.6.2
+    container_name: cluster-diag-pushgateway
+    restart: unless-stopped
+    ports:
+      - "9091:9091"
+
+  # Grafana - 可视化面板
+  grafana:
+    image: grafana/grafana:10.2.0
+    container_name: cluster-diag-grafana
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=cluster-diag-2024
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_SERVER_ROOT_URL=http://localhost:3000
+    depends_on:
+      - prometheus
+
+  # Alertmanager - 告警管理
+  alertmanager:
+    image: prom/alertmanager:v0.26.0
+    container_name: cluster-diag-alertmanager
+    restart: unless-stopped
+    ports:
+      - "9093:9093"
+    volumes:
+      - ./alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+
+volumes:
+  diag-data:
+    driver: local
+  prometheus-data:
+    driver: local
+  grafana-data:
+    driver: local

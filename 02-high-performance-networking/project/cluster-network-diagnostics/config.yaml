@@ -1,0 +1,192 @@
+# 集群网络诊断平台 - 默认配置文件
+
+# 集群基本信息
+cluster_name: "AI-Training-Cluster-01"
+cluster_description: "8节点A100 GPU训练集群，HDR InfiniBand互联"
+
+# 节点列表
+nodes:
+  - hostname: gpu-node-01
+    ip: 10.0.1.1
+    gpus: 8
+    rdma_devices:
+      - name: mlx5_0
+        ports: [1]
+      - name: mlx5_1
+        ports: [1]
+  - hostname: gpu-node-02
+    ip: 10.0.1.2
+    gpus: 8
+    rdma_devices:
+      - name: mlx5_0
+        ports: [1]
+      - name: mlx5_1
+        ports: [1]
+  - hostname: gpu-node-03
+    ip: 10.0.1.3
+    gpus: 8
+    rdma_devices:
+      - name: mlx5_0
+        ports: [1]
+      - name: mlx5_1
+        ports: [1]
+  - hostname: gpu-node-04
+    ip: 10.0.1.4
+    gpus: 8
+    rdma_devices:
+      - name: mlx5_0
+        ports: [1]
+      - name: mlx5_1
+        ports: [1]
+  - hostname: gpu-node-05
+    ip: 10.0.1.5
+    gpus: 8
+    rdma_devices:
+      - name: mlx5_0
+        ports: [1]
+      - name: mlx5_1
+        ports: [1]
+  - hostname: gpu-node-06
+    ip: 10.0.1.6
+    gpus: 8
+    rdma_devices:
+      - name: mlx5_0
+        ports: [1]
+      - name: mlx5_1
+        ports: [1]
+  - hostname: gpu-node-07
+    ip: 10.0.1.7
+    gpus: 8
+    rdma_devices:
+      - name: mlx5_0
+        ports: [1]
+      - name: mlx5_1
+        ports: [1]
+  - hostname: gpu-node-08
+    ip: 10.0.1.8
+    gpus: 8
+    rdma_devices:
+      - name: mlx5_0
+        ports: [1]
+      - name: mlx5_1
+        ports: [1]
+
+# SSH连接配置
+ssh_user: root
+ssh_port: 22
+ssh_key: ~/.ssh/id_rsa
+ssh_timeout: 30
+
+# 子网管理器节点
+subnet_manager_node: 10.0.1.1
+
+# 扫描和并发配置
+max_scan_workers: 8
+max_workers: 8
+
+# 链路健康检查阈值
+thresholds:
+  symbol_errors_warning: 10
+  symbol_errors_critical: 100
+  link_error_recovery_warning: 5
+  link_error_recovery_critical: 50
+  port_rcv_errors_warning: 10
+  port_rcv_errors_critical: 100
+  local_link_integrity_warning: 5
+  local_link_integrity_critical: 50
+  excessive_buffer_overrun_warning: 1
+  excessive_buffer_overrun_critical: 10
+  fec_uncorrectable_warning: 1
+  fec_uncorrectable_critical: 10
+  cable_temp_warning: 65.0
+  cable_temp_critical: 75.0
+  rx_power_low_warning: -10.0
+  rx_power_low_critical: -14.0
+
+# PFC死锁检测配置
+pfc_thresholds:
+  pause_rate_warning: 100        # PFC暂停帧/秒 告警阈值
+  pause_rate_storm: 1000         # PFC风暴阈值
+  pause_duration_warning_us: 100
+  pause_duration_critical_us: 1000
+  deadlock_detection_cycles: 3   # 连续多少个周期判定为死锁
+
+# RoCE优先级配置
+roce_priorities: [3]  # TC3用于RoCE流量
+
+# 错误分析配置
+analysis_window_hours: 24
+sample_interval_minutes: 5
+history_store_path: /var/lib/cluster-diag/error_history.json
+
+# 带宽基准测试配置
+bandwidth_benchmark:
+  message_sizes: [4096, 65536, 262144, 1048576, 4194304, 16777216]
+  iterations: 5000
+  transport: RC
+  device: mlx5_0
+  ib_port: 1
+  gid_index: -1             # -1表示IB模式无需GID，RoCE设为3
+  server_port_base: 18515
+  link_speed: HDR            # 链路速度类型
+  efficiency_threshold: 0.85 # 低于85%视为不达标
+  bandwidth_test_timeout: 120
+
+# 延迟基准测试配置
+latency_benchmark:
+  message_sizes: [2, 8, 64, 256, 1024, 4096]
+  iterations: 10000
+  device: mlx5_0
+  ib_port: 1
+  gid_index: -1
+  server_port_base: 19515
+  outlier_factor: 2.0        # 超过平均值N倍视为离群点
+  latency_test_timeout: 120
+
+# NCCL基准测试配置
+nccl_benchmark:
+  nccl_tests_path: /usr/local/bin
+  min_bytes: "8"
+  max_bytes: "8G"
+  step_factor: 2
+  iterations: 20
+  warmup_iterations: 5
+  data_type: float
+  reduction_op: sum
+  gpus_per_node: 8
+  timeout: 600
+  mpi_path: /usr/local/bin/mpirun
+  hostfile: ""
+  nccl_env:
+    NCCL_DEBUG: "WARN"
+    NCCL_IB_DISABLE: "0"
+    NCCL_NET_GDR_LEVEL: "5"
+    NCCL_IB_HCA: "mlx5"
+    NCCL_SOCKET_IFNAME: "eth0"
+    NCCL_IB_GID_INDEX: "3"
+    NCCL_IB_TIMEOUT: "23"
+    NCCL_IB_RETRY_CNT: "7"
+
+# 报告生成配置
+report_output_dir: /var/lib/cluster-diag/reports
+
+# 可视化配置
+visualization:
+  graph_direction: TB
+  show_port_numbers: true
+  show_bandwidth: true
+
+# 定时任务配置
+schedule:
+  health_check_interval_minutes: 5    # 每5分钟执行健康检查
+  full_diagnosis_interval_hours: 1    # 每小时执行完整诊断
+  benchmark_interval_hours: 24        # 每天执行基准测试
+  report_generation_hours: 6          # 每6小时生成报告
+
+# 日志配置
+logging:
+  level: INFO
+  format: "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+  file: /var/log/cluster-diag/diagnostics.log
+  max_size_mb: 100
+  backup_count: 5

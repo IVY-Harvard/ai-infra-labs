@@ -1,0 +1,91 @@
+# Network Test Pod - Validates SR-IOV, RDMA, and multi-NIC setup
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: network-test
+  annotations:
+    k8s.v1.cni.cncf.io/networks: rdma-net
+spec:
+  containers:
+    - name: test
+      image: mellanox/rping-test:latest
+      command: ["/bin/bash", "-c"]
+      args:
+        - |
+          echo "=== Network Interface Check ==="
+          ip addr show
+          echo ""
+          echo "=== RDMA Device Check ==="
+          ibv_devinfo || echo "No RDMA devices found"
+          echo ""
+          echo "=== SR-IOV VF Check ==="
+          ls -la /sys/class/infiniband/ 2>/dev/null || echo "No IB devices"
+          ls -la /sys/class/net/*/device/driver 2>/dev/null
+          echo ""
+          echo "=== Bandwidth Test (loopback) ==="
+          ib_write_bw -d mlx5_0 --report_gbits -D 5 &
+          sleep 1
+          ib_write_bw -d mlx5_0 localhost --report_gbits -D 5
+          echo ""
+          echo "=== Latency Test (loopback) ==="
+          ib_write_lat -d mlx5_0 -D 5 &
+          sleep 1
+          ib_write_lat -d mlx5_0 localhost -D 5
+          echo ""
+          echo "=== Tests Complete ==="
+          sleep infinity
+      resources:
+        requests:
+          openshift.io/mlnx_rdma_vf: 1
+        limits:
+          openshift.io/mlnx_rdma_vf: 1
+      securityContext:
+        capabilities:
+          add: ["IPC_LOCK", "NET_RAW"]
+  restartPolicy: Never
+---
+# Two-pod RDMA throughput test
+apiVersion: v1
+kind: Pod
+metadata:
+  name: rdma-server
+  annotations:
+    k8s.v1.cni.cncf.io/networks: rdma-net
+spec:
+  nodeName: gpu-node-01
+  containers:
+    - name: server
+      image: mellanox/rping-test:latest
+      command: ["ib_write_bw", "-d", "mlx5_0", "--report_gbits"]
+      resources:
+        requests:
+          openshift.io/mlnx_rdma_vf: 1
+        limits:
+          openshift.io/mlnx_rdma_vf: 1
+      securityContext:
+        capabilities:
+          add: ["IPC_LOCK"]
+  restartPolicy: Never
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: rdma-client
+  annotations:
+    k8s.v1.cni.cncf.io/networks: rdma-net
+spec:
+  nodeName: gpu-node-02
+  containers:
+    - name: client
+      image: mellanox/rping-test:latest
+      command: ["/bin/bash", "-c", "sleep 5 && ib_write_bw -d mlx5_0 192.168.100.10 --report_gbits"]
+      resources:
+        requests:
+          openshift.io/mlnx_rdma_vf: 1
+        limits:
+          openshift.io/mlnx_rdma_vf: 1
+      securityContext:
+        capabilities:
+          add: ["IPC_LOCK"]
+  restartPolicy: Never

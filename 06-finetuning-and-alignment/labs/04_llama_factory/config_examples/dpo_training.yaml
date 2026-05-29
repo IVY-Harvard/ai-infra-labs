@@ -1,0 +1,40 @@
+# ========================================
+# Qwen2-7B DPO 偏好优化配置
+# 需要先完成 SFT 训练
+# ========================================
+
+### Model
+model_name_or_path: Qwen/Qwen2-7B
+adapter_name_or_path: outputs/qwen2-7b-lora-sft  # SFT 阶段的 LoRA
+trust_remote_code: true
+
+### Method
+stage: dpo
+do_train: true
+finetuning_type: lora
+lora_rank: 64
+lora_alpha: 128
+lora_target: all
+pref_beta: 0.1                # DPO beta 参数
+pref_loss: sigmoid             # DPO loss 类型
+
+### Dataset
+dataset: my_preference_data    # 需要 chosen/rejected 字段
+template: qwen
+cutoff_len: 2048
+
+### Output
+output_dir: outputs/qwen2-7b-dpo
+logging_steps: 10
+save_steps: 200
+overwrite_output_dir: true
+
+### Training
+per_device_train_batch_size: 2
+gradient_accumulation_steps: 8
+learning_rate: 5.0e-7          # DPO 需要更小的学习率
+num_train_epochs: 1.0
+lr_scheduler_type: cosine
+warmup_ratio: 0.1
+bf16: true
+gradient_checkpointing: true

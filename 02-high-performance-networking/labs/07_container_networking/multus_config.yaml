@@ -1,0 +1,71 @@
+# Multus CNI - Multi-NIC Pod Configuration
+# Attaches both default Kubernetes network and SR-IOV RDMA interface
+---
+apiVersion: k8s.cni.cncf.io/v1
+kind: NetworkAttachmentDefinition
+metadata:
+  name: macvlan-mgmt
+  namespace: default
+spec:
+  config: |
+    {
+      "cniVersion": "0.3.1",
+      "type": "macvlan",
+      "master": "eth1",
+      "mode": "bridge",
+      "ipam": {
+        "type": "host-local",
+        "subnet": "10.10.0.0/16",
+        "rangeStart": "10.10.1.10",
+        "rangeEnd": "10.10.1.250"
+      }
+    }
+---
+# Pod with multiple interfaces: default + RDMA + management
+apiVersion: v1
+kind: Pod
+metadata:
+  name: multi-nic-training-pod
+  annotations:
+    k8s.v1.cni.cncf.io/networks: |
+      [
+        {
+          "name": "rdma-net",
+          "namespace": "default",
+          "interface": "rdma0"
+        },
+        {
+          "name": "macvlan-mgmt",
+          "namespace": "default",
+          "interface": "mgmt0"
+        }
+      ]
+spec:
+  containers:
+    - name: trainer
+      image: nvcr.io/nvidia/pytorch:24.01-py3
+      resources:
+        requests:
+          nvidia.com/gpu: 1
+          openshift.io/mlnx_rdma_vf: 1
+        limits:
+          nvidia.com/gpu: 1
+          openshift.io/mlnx_rdma_vf: 1
+      securityContext:
+        capabilities:
+          add: ["IPC_LOCK"]
+      env:
+        - name: NCCL_IB_DISABLE
+          value: "0"
+        - name: NCCL_NET_GDR_LEVEL
+          value: "5"
+        - name: NCCL_IB_HCA
+          value: "mlx5"
+      volumeMounts:
+        - name: shm
+          mountPath: /dev/shm
+  volumes:
+    - name: shm
+      emptyDir:
+        medium: Memory
+        sizeLimit: 16Gi

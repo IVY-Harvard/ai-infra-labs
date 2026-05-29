@@ -1,0 +1,456 @@
+# =============================================================================
+# DCGM Exporter 生产级 Kubernetes 部署
+#
+# 包含：
+#   1. Namespace
+#   2. ConfigMap（自定义指标清单）
+#   3. DaemonSet（DCGM Exporter 主体）
+#   4. Service + ServiceMonitor（Prometheus Operator 自动发现）
+#   5. PrometheusRule（Recording Rules + Alert Rules）
+#
+# 部署：
+#   kubectl apply -f dcgm_exporter_setup.yaml
+#
+# 前置条件：
+#   - NVIDIA GPU Operator 或 nvidia-driver + nvidia-container-toolkit 已安装
+#   - Prometheus Operator (kube-prometheus-stack) 已部署
+#   - DCGM 2.4+ 支持 Profiling Metrics
+# =============================================================================
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: gpu-monitoring
+  labels:
+    app.kubernetes.io/part-of: gpu-observability
+
+---
+# =============================================================================
+# ConfigMap: 自定义指标采集清单
+# 将 custom_metrics.csv 内容嵌入 ConfigMap
+# =============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: dcgm-exporter-metrics
+  namespace: gpu-monitoring
+  labels:
+    app: dcgm-exporter
+data:
+  custom-metrics.csv: |
+    # Profiling Metrics (核心)
+    DCGM_FI_PROF_SM_ACTIVE, gauge, SM Active ratio
+    DCGM_FI_PROF_SM_OCCUPANCY, gauge, SM Occupancy ratio
+    DCGM_FI_PROF_PIPE_TENSOR_ACTIVE, gauge, Tensor Core pipe active ratio
+    DCGM_FI_PROF_PIPE_FP32_ACTIVE, gauge, FP32 pipe active ratio
+    DCGM_FI_PROF_PIPE_FP16_ACTIVE, gauge, FP16 pipe active ratio
+    DCGM_FI_PROF_DRAM_ACTIVE, gauge, DRAM active ratio
+    DCGM_FI_PROF_NVLINK_TX_BYTES, gauge, NVLink TX bytes/s
+    DCGM_FI_PROF_NVLINK_RX_BYTES, gauge, NVLink RX bytes/s
+    DCGM_FI_PROF_PCIE_TX_BYTES, gauge, PCIe TX bytes/s
+    DCGM_FI_PROF_PCIE_RX_BYTES, gauge, PCIe RX bytes/s
+    # Health Metrics
+    DCGM_FI_DEV_GPU_TEMP, gauge, GPU temperature (C)
+    DCGM_FI_DEV_MEMORY_TEMP, gauge, Memory temperature (C)
+    DCGM_FI_DEV_POWER_USAGE, gauge, Power usage (W)
+    DCGM_FI_DEV_ECC_SBE_VOL_TOTAL, gauge, ECC single-bit errors
+    DCGM_FI_DEV_ECC_DBE_VOL_TOTAL, gauge, ECC double-bit errors
+    DCGM_FI_DEV_CLOCK_THROTTLE_REASONS, gauge, Clock throttle reasons
+    DCGM_FI_DEV_PCIE_REPLAY_COUNTER, gauge, PCIe replay counter
+    # Memory & Clock
+    DCGM_FI_DEV_FB_USED, gauge, Framebuffer used (MB)
+    DCGM_FI_DEV_FB_FREE, gauge, Framebuffer free (MB)
+    DCGM_FI_DEV_SM_CLOCK, gauge, SM clock (MHz)
+    DCGM_FI_DEV_MEM_CLOCK, gauge, Memory clock (MHz)
+
+---
+# =============================================================================
+# DaemonSet: 确保每个 GPU 节点运行一个 DCGM Exporter
+# =============================================================================
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: dcgm-exporter
+  namespace: gpu-monitoring
+  labels:
+    app: dcgm-exporter
+    app.kubernetes.io/name: dcgm-exporter
+    app.kubernetes.io/part-of: gpu-observability
+spec:
+  selector:
+    matchLabels:
+      app: dcgm-exporter
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1       # 滚动更新时每次最多 1 个不可用
+  template:
+    metadata:
+      labels:
+        app: dcgm-exporter
+      annotations:
+        # Prometheus 自动发现注解（备用，ServiceMonitor 优先）
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9400"
+        prometheus.io/path: "/metrics"
+    spec:
+      # 仅调度到有 GPU 的节点
+      nodeSelector:
+        nvidia.com/gpu.present: "true"
+
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+
+      # 使用 hostNetwork 可避免 Pod IP 变化导致的采集中断（可选）
+      # hostNetwork: true
+
+      containers:
+        - name: dcgm-exporter
+          image: nvcr.io/nvidia/k8s/dcgm-exporter:3.3.8-3.6.0-ubuntu22.04
+          # 生产环境锁定版本，避免 :latest
+
+          args:
+            # 使用自定义指标清单
+            - "--collectors"
+            - "/etc/dcgm-exporter/custom-metrics.csv"
+            # 采集间隔 15s（Profiling Metrics 推荐）
+            - "--collect-interval"
+            - "15000"
+            # 开启 Profiling Metrics
+            - "--collecting-mode"
+            - "1"
+
+          ports:
+            - name: metrics
+              containerPort: 9400
+              protocol: TCP
+
+          # 健康检查
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 9400
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 9400
+            initialDelaySeconds: 15
+            periodSeconds: 15
+            timeoutSeconds: 5
+
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+
+          # DCGM 需要访问 GPU 设备
+          securityContext:
+            privileged: false
+            capabilities:
+              add: ["SYS_ADMIN"]   # DCGM Profiling 需要 SYS_ADMIN
+
+          volumeMounts:
+            - name: custom-metrics
+              mountPath: /etc/dcgm-exporter/
+              readOnly: true
+            # DCGM 通信 socket
+            - name: dcgm-socket
+              mountPath: /var/run/nvidia/dcgm
+
+          env:
+            # 指定要监控的 GPU（默认全部）
+            # - name: DCGM_EXPORTER_DEVICES
+            #   value: "0,1,2,3,4,5,6,7"
+            # 日志级别
+            - name: DCGM_EXPORTER_LOG_LEVEL
+              value: "info"
+
+      volumes:
+        - name: custom-metrics
+          configMap:
+            name: dcgm-exporter-metrics
+        - name: dcgm-socket
+          hostPath:
+            path: /var/run/nvidia/dcgm
+            type: DirectoryOrCreate
+
+---
+# =============================================================================
+# Service: 暴露 DCGM Exporter 端口
+# =============================================================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: dcgm-exporter
+  namespace: gpu-monitoring
+  labels:
+    app: dcgm-exporter
+    # ServiceMonitor 通过此 label 发现 Service
+    monitoring: gpu-metrics
+spec:
+  selector:
+    app: dcgm-exporter
+  ports:
+    - name: metrics
+      port: 9400
+      targetPort: 9400
+      protocol: TCP
+  clusterIP: None    # Headless Service，每个 Pod 都会被 scrape
+
+---
+# =============================================================================
+# ServiceMonitor: Prometheus Operator 自动发现
+# =============================================================================
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: dcgm-exporter
+  namespace: gpu-monitoring
+  labels:
+    app: dcgm-exporter
+    # 确保被 Prometheus Operator 的 serviceMonitorSelector 匹配到
+    release: kube-prometheus-stack
+spec:
+  selector:
+    matchLabels:
+      monitoring: gpu-metrics
+  namespaceSelector:
+    matchNames:
+      - gpu-monitoring
+  endpoints:
+    - port: metrics
+      interval: 15s            # 采集间隔 = DCGM 采集间隔
+      scrapeTimeout: 10s       # 超时要小于间隔
+      honorLabels: true        # 保留 DCGM Exporter 原始 label
+      metricRelabelings:
+        # 添加集群标签（多集群场景）
+        - sourceLabels: [__name__]
+          regex: "DCGM_FI_.*"
+          targetLabel: cluster
+          replacement: "prod-gpu-01"
+        # 丢弃不需要的 DCGM 内部指标
+        - sourceLabels: [__name__]
+          regex: "dcgm_exporter_.*"
+          action: drop
+
+---
+# =============================================================================
+# PrometheusRule: Recording Rules + Alert Rules
+#
+# Recording Rules 预计算常用聚合，加速 Dashboard 查询
+# Alert Rules 在指标异常时触发告警
+# =============================================================================
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: dcgm-gpu-rules
+  namespace: gpu-monitoring
+  labels:
+    app: dcgm-exporter
+    release: kube-prometheus-stack
+spec:
+  groups:
+    # ============================
+    # Recording Rules
+    # ============================
+    - name: gpu.recording_rules
+      interval: 15s
+      rules:
+        # ------ 真实计算效率 ------
+        # = Tensor Core Active × SM Active
+        - record: gpu:compute_efficiency:ratio
+          expr: >
+            DCGM_FI_PROF_PIPE_TENSOR_ACTIVE * DCGM_FI_PROF_SM_ACTIVE
+
+        # ------ 5 分钟滑动平均 ------
+        - record: gpu:sm_active:avg5m
+          expr: avg_over_time(DCGM_FI_PROF_SM_ACTIVE[5m])
+
+        - record: gpu:tensor_active:avg5m
+          expr: avg_over_time(DCGM_FI_PROF_PIPE_TENSOR_ACTIVE[5m])
+
+        - record: gpu:dram_active:avg5m
+          expr: avg_over_time(DCGM_FI_PROF_DRAM_ACTIVE[5m])
+
+        - record: gpu:sm_occupancy:avg5m
+          expr: avg_over_time(DCGM_FI_PROF_SM_OCCUPANCY[5m])
+
+        # ------ 集群级聚合 ------
+        - record: cluster:gpu_compute_efficiency:avg
+          expr: avg(gpu:compute_efficiency:ratio)
+
+        - record: cluster:gpu_sm_active:avg
+          expr: avg(DCGM_FI_PROF_SM_ACTIVE)
+
+        - record: cluster:gpu_dram_active:avg
+          expr: avg(DCGM_FI_PROF_DRAM_ACTIVE)
+
+        # ------ NVLink 总带宽 ------
+        - record: gpu:nvlink_bandwidth:bytes_per_sec
+          expr: >
+            DCGM_FI_PROF_NVLINK_TX_BYTES + DCGM_FI_PROF_NVLINK_RX_BYTES
+
+        # ------ 显存使用率 ------
+        - record: gpu:fb_utilization:ratio
+          expr: >
+            DCGM_FI_DEV_FB_USED / (DCGM_FI_DEV_FB_USED + DCGM_FI_DEV_FB_FREE)
+
+        # ------ 功耗效率（每瓦计算效率）------
+        - record: gpu:compute_per_watt:ratio
+          expr: >
+            gpu:compute_efficiency:ratio / (DCGM_FI_DEV_POWER_USAGE > 0)
+
+        # ------ GPU 负载均衡度（标准差 / 均值）------
+        - record: cluster:gpu_load_imbalance:ratio
+          expr: >
+            stddev(DCGM_FI_PROF_SM_ACTIVE) / (avg(DCGM_FI_PROF_SM_ACTIVE) > 0)
+
+    # ============================
+    # Alert Rules
+    # ============================
+    - name: gpu.alert_rules
+      rules:
+        # ------ 温度告警 ------
+        - alert: GPUTemperatureHigh
+          expr: DCGM_FI_DEV_GPU_TEMP > 85
+          for: 5m
+          labels:
+            severity: warning
+            team: infra
+          annotations:
+            summary: "GPU {{ $labels.gpu }} 温度偏高"
+            description: "GPU {{ $labels.gpu }} on {{ $labels.instance }} 温度 {{ $value }}°C，持续 5 分钟超过 85°C。"
+            runbook: "https://wiki.internal/gpu-thermal-troubleshooting"
+
+        - alert: GPUTemperatureCritical
+          expr: DCGM_FI_DEV_GPU_TEMP > 92
+          for: 2m
+          labels:
+            severity: critical
+            team: infra
+          annotations:
+            summary: "GPU {{ $labels.gpu }} 温度危险"
+            description: "GPU {{ $labels.gpu }} 温度 {{ $value }}°C，即将触发硬件保护限频。"
+
+        - alert: HBMTemperatureCritical
+          expr: DCGM_FI_DEV_MEMORY_TEMP > 100
+          for: 2m
+          labels:
+            severity: critical
+            team: infra
+          annotations:
+            summary: "HBM 温度危险: {{ $value }}°C"
+            description: "GPU {{ $labels.gpu }} HBM 温度超过 100°C，可能导致 HBM 降频或 GPU 降速。"
+
+        # ------ ECC 错误 ------
+        - alert: GPUDoubleBitECC
+          expr: DCGM_FI_DEV_ECC_DBE_VOL_TOTAL > 0
+          for: 0m
+          labels:
+            severity: critical
+            team: infra
+          annotations:
+            summary: "GPU {{ $labels.gpu }} 出现不可纠正 ECC 错误"
+            description: "DBE 错误 = {{ $value }}。此 GPU 数据可能已损坏，建议立即停止使用并提交 RMA。"
+
+        - alert: GPUSingleBitECCHigh
+          expr: rate(DCGM_FI_DEV_ECC_SBE_VOL_TOTAL[5m]) > 5
+          for: 10m
+          labels:
+            severity: warning
+            team: infra
+          annotations:
+            summary: "GPU {{ $labels.gpu }} 单比特 ECC 错误率偏高"
+            description: "SBE 错误率 = {{ $value }}/min。持续升高可能是 GPU 老化信号。"
+
+        # ------ 限频告警 ------
+        - alert: GPUThermalThrottling
+          expr: >
+            (DCGM_FI_DEV_CLOCK_THROTTLE_REASONS
+              AND
+              (DCGM_FI_DEV_CLOCK_THROTTLE_REASONS >= 8)
+            ) > 0
+          for: 5m
+          labels:
+            severity: warning
+            team: infra
+          annotations:
+            summary: "GPU {{ $labels.gpu }} 正在热限频"
+            description: "限频原因 bitmap = 0x{{ printf \"%02x\" $value }}。检查散热或降低功率上限。"
+
+        # ------ 效率告警 ------
+        - alert: GPULowComputeEfficiency
+          expr: >
+            gpu:compute_efficiency:ratio < 0.05
+            AND DCGM_FI_PROF_SM_ACTIVE > 0.3
+          for: 10m
+          labels:
+            severity: warning
+            team: ml-platform
+          annotations:
+            summary: "GPU {{ $labels.gpu }} 计算效率极低"
+            description: >
+              Tensor Core 利用率 < 5% 但 SM Active > 30%。
+              GPU 在忙但不是在做 AI 计算。检查 workload 是否正确使用 Tensor Core。
+
+        - alert: GPULowOccupancy
+          expr: >
+            gpu:sm_occupancy:avg5m < 0.2
+            AND DCGM_FI_PROF_SM_ACTIVE > 0.3
+          for: 10m
+          labels:
+            severity: warning
+            team: ml-platform
+          annotations:
+            summary: "GPU {{ $labels.gpu }} SM Occupancy 持续偏低"
+            description: >
+              5 分钟平均 Occupancy = {{ $value }}。
+              GPU 无法有效隐藏内存延迟。考虑增大 batch size 或优化 kernel。
+
+        # ------ 负载均衡告警 ------
+        - alert: GPULoadImbalance
+          expr: cluster:gpu_load_imbalance:ratio > 0.3
+          for: 10m
+          labels:
+            severity: warning
+            team: ml-platform
+          annotations:
+            summary: "GPU 负载不均衡"
+            description: >
+              GPU 间负载变异系数 = {{ $value }}（> 0.3）。
+              检查 Tensor Parallel 配置或请求路由是否均匀。
+
+        # ------ 显存告警 ------
+        - alert: GPUMemoryNearFull
+          expr: gpu:fb_utilization:ratio > 0.95
+          for: 5m
+          labels:
+            severity: warning
+            team: ml-platform
+          annotations:
+            summary: "GPU {{ $labels.gpu }} 显存即将耗尽"
+            description: >
+              显存使用率 = {{ printf "%.1f" (mul $value 100) }}%。
+              可能导致 OOM 或 KV Cache 驱逐。考虑减小 max_model_len 或增加 GPU 数量。
+
+        # ------ PCIe 链路质量 ------
+        - alert: PCIeReplayHigh
+          expr: rate(DCGM_FI_DEV_PCIE_REPLAY_COUNTER[5m]) > 10
+          for: 10m
+          labels:
+            severity: warning
+            team: infra
+          annotations:
+            summary: "GPU {{ $labels.gpu }} PCIe 重传率偏高"
+            description: "重传率 = {{ $value }}/s。检查 PCIe 线缆或插槽。"

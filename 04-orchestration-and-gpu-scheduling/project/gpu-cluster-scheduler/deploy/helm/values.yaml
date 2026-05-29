@@ -1,0 +1,116 @@
+# GPU Cluster Scheduler Helm Values
+
+replicaCount: 2
+
+image:
+  repository: gpu-cluster-scheduler
+  tag: latest
+  pullPolicy: IfNotPresent
+
+# 调度器配置
+scheduler:
+  # 调度策略：topology_aware, bin_packing, spread
+  strategy: topology_aware
+
+  # 调度权重
+  topologyWeight: 0.4
+  binPackingWeight: 0.4
+  resourceBalanceWeight: 0.2
+
+  # 调度间隔（秒）
+  intervalSeconds: 1
+
+  # 抢占配置
+  preemption:
+    enabled: true
+    minPriorityGap: 3
+    gracePeriodSeconds: 30
+    maxPreemptionsPerCycle: 2
+    protectRunningMinutes: 5
+
+# 集群资源（你的 8x H20 环境）
+cluster:
+  totalGPUs: 8
+  gpuType: "NVIDIA-H20"
+  gpuMemoryGB: 96
+
+# 租户配额
+tenants:
+  - name: team-training
+    gpuQuota: 4
+    gpuBurstLimit: 8
+    priorityDefault: 7
+    canBorrow: true
+    preemptible: false
+
+  - name: team-inference
+    gpuQuota: 2
+    gpuBurstLimit: 4
+    priorityDefault: 8
+    canBorrow: true
+    preemptible: false
+
+  - name: team-experiment
+    gpuQuota: 2
+    gpuBurstLimit: 6
+    priorityDefault: 3
+    canBorrow: true
+    preemptible: true    # 借用的资源可被回收
+
+# API Server
+api:
+  port: 8000
+
+# 资源限制
+resources:
+  requests:
+    cpu: 200m
+    memory: 512Mi
+  limits:
+    cpu: 1000m
+    memory: 1Gi
+
+# 健康检查
+healthCheck:
+  gpuCheckInterval: 30
+  eccErrorThreshold: 5
+  temperatureThreshold: 85
+  consecutiveFailures: 3
+
+# 监控
+monitoring:
+  enabled: true
+  serviceMonitor:
+    enabled: true
+    interval: 15s
+
+# RBAC
+rbac:
+  create: true
+  rules:
+    - apiGroups: [""]
+      resources: ["nodes"]
+      verbs: ["get", "list", "watch", "patch"]
+    - apiGroups: [""]
+      resources: ["pods"]
+      verbs: ["get", "list", "watch", "create", "delete"]
+    - apiGroups: [""]
+      resources: ["pods/binding"]
+      verbs: ["create"]
+    - apiGroups: [""]
+      resources: ["events"]
+      verbs: ["create", "patch"]
+
+# ServiceAccount
+serviceAccount:
+  create: true
+  name: gpu-scheduler
+
+# Node selector for scheduler pods (run on control plane or CPU nodes)
+nodeSelector:
+  kubernetes.io/os: linux
+
+tolerations:
+  - key: node-role.kubernetes.io/control-plane
+    operator: Exists
+    effect: NoSchedule

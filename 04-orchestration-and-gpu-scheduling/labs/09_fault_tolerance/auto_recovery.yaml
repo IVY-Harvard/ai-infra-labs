@@ -1,0 +1,236 @@
+# GPU 工作负载自动恢复配置
+#
+# 包含：
+#   1. PodDisruptionBudget — 推理服务高可用
+#   2. PriorityClass — 关键任务优先恢复
+#   3. 训练任务自动重启策略
+#   4. Node Problem Detector 规则
+
+---
+# 1. 推理服务 PDB — 保证最小可用副本
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: llm-inference-pdb
+  namespace: ml-serving
+spec:
+  minAvailable: 2              # 始终保持 2 个副本可用
+  selector:
+    matchLabels:
+      app: llm-inference
+
+---
+# 2. PriorityClass 定义
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: gpu-critical
+value: 1000000
+globalDefault: false
+description: "关键 GPU 工作负载，最高优先级"
+preemptionPolicy: PreemptLowerPriority
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: gpu-production
+value: 100000
+globalDefault: false
+description: "生产 GPU 工作负载"
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: gpu-experiment
+value: 1000
+globalDefault: false
+description: "实验性 GPU 工作负载，可被抢占"
+
+---
+# 3. 带自动恢复的训练 Job
+apiVersion: kubeflow.org/v1
+kind: PyTorchJob
+metadata:
+  name: fault-tolerant-training
+  namespace: ml-training
+spec:
+  elasticPolicy:
+    rdzvBackend: c10d
+    minReplicas: 2
+    maxReplicas: 4
+    maxRestarts: 10           # 允许多次重启
+  pytorchReplicaSpecs:
+    Worker:
+      replicas: 4
+      restartPolicy: OnFailure    # 失败自动重启
+      template:
+        metadata:
+          labels:
+            app: fault-tolerant-training
+        spec:
+          priorityClassName: gpu-production
+          # 容忍短暂的 GPU 降级（不因降级被驱逐）
+          tolerations:
+          - key: nvidia.com/gpu-degraded
+            operator: Exists
+            effect: NoSchedule
+          # 但不容忍完全故障
+          # nvidia.com/gpu-unhealthy: NoExecute 会驱逐 Pod
+          containers:
+          - name: trainer
+            image: fault-tolerant-training:latest
+            command:
+            - python
+            - train_with_recovery.py
+            - --checkpoint-dir=/checkpoints
+            - --auto-resume=true
+            - --checkpoint-every-n-steps=500
+            resources:
+              limits:
+                nvidia.com/gpu: 2
+            volumeMounts:
+            - name: checkpoints
+              mountPath: /checkpoints
+            # 健康检查：检测训练进程是否卡死
+            livenessProbe:
+              exec:
+                command:
+                - python
+                - health_check_probe.py
+                - --mode=liveness
+              initialDelaySeconds: 120    # 给模型加载时间
+              periodSeconds: 30
+              timeoutSeconds: 10
+              failureThreshold: 3         # 连续 3 次失败才重启
+            # 就绪检查：训练是否已初始化完成
+            readinessProbe:
+              exec:
+                command:
+                - python
+                - health_check_probe.py
+                - --mode=readiness
+              initialDelaySeconds: 60
+              periodSeconds: 15
+          volumes:
+          - name: checkpoints
+            persistentVolumeClaim:
+              claimName: training-checkpoints
+
+---
+# 4. Node Problem Detector 自定义规则（GPU 特定）
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gpu-monitor-config
+  namespace: node-problem-detector
+data:
+  gpu-custom-plugin-monitor.json: |
+    {
+      "plugin": "custom",
+      "pluginConfig": {
+        "invoke_interval": "30s",
+        "timeout": "10s",
+        "max_output_length": 256,
+        "concurrency": 1
+      },
+      "source": "gpu-custom-monitor",
+      "metricsReporting": true,
+      "conditions": [
+        {
+          "type": "GPUUnhealthy",
+          "reason": "GPUIsHealthy",
+          "message": "All GPUs are healthy"
+        }
+      ],
+      "rules": [
+        {
+          "type": "permanent",
+          "condition": "GPUUnhealthy",
+          "reason": "GPUHasECCErrors",
+          "path": "/custom-plugins/check_gpu_ecc.sh",
+          "message": "GPU has uncorrectable ECC errors"
+        },
+        {
+          "type": "temporary",
+          "reason": "GPUOverheating",
+          "path": "/custom-plugins/check_gpu_temp.sh",
+          "message": "GPU temperature exceeds threshold"
+        }
+      ]
+    }
+
+---
+# 5. GPU 健康检查脚本 ConfigMap
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gpu-health-check-scripts
+  namespace: node-problem-detector
+data:
+  check_gpu_ecc.sh: |
+    #!/bin/bash
+    # 检查所有 GPU 的 ECC uncorrectable 错误
+    THRESHOLD=5
+
+    for gpu_id in $(seq 0 7); do
+      ecc_errors=$(nvidia-smi -i $gpu_id --query-gpu=ecc.errors.uncorrected.volatile.total --format=csv,noheader,nounits 2>/dev/null)
+
+      if [ $? -ne 0 ]; then
+        echo "nvidia-smi failed for GPU $gpu_id"
+        exit 1
+      fi
+
+      if [ "${ecc_errors:-0}" -ge "$THRESHOLD" ]; then
+        echo "GPU $gpu_id has $ecc_errors uncorrectable ECC errors (threshold: $THRESHOLD)"
+        exit 1
+      fi
+    done
+
+    echo "All GPUs ECC check passed"
+    exit 0
+
+  check_gpu_temp.sh: |
+    #!/bin/bash
+    # 检查所有 GPU 温度
+    THRESHOLD=85
+
+    for gpu_id in $(seq 0 7); do
+      temp=$(nvidia-smi -i $gpu_id --query-gpu=temperature.gpu --format=csv,noheader,nounits 2>/dev/null)
+
+      if [ $? -ne 0 ]; then
+        echo "nvidia-smi failed for GPU $gpu_id"
+        exit 1
+      fi
+
+      if [ "${temp:-0}" -ge "$THRESHOLD" ]; then
+        echo "GPU $gpu_id temperature ${temp}C exceeds threshold ${THRESHOLD}C"
+        exit 1
+      fi
+    done
+
+    echo "All GPUs temperature check passed"
+    exit 0
+
+---
+# 6. 故障恢复测试 CronJob（定期验证恢复机制有效）
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: gpu-recovery-drill
+  namespace: ml-ops
+spec:
+  schedule: "0 3 * * 0"    # 每周日凌晨 3 点
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          containers:
+          - name: drill
+            image: gpu-ops-tools:latest
+            command:
+            - python
+            - recovery_drill.py
+            - --simulate-failure=ecc
+            - --verify-recovery=true
+            - --timeout=300
+          restartPolicy: Never

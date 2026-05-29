@@ -1,0 +1,25 @@
+# Default configuration for Mini Inference Engine
+
+model:
+  name: "gpt2"
+  dtype: "float16"
+  max_model_len: 1024
+
+engine:
+  block_size: 16
+  num_gpu_blocks: 256
+  num_cpu_blocks: 64
+  gpu_memory_utilization: 0.9
+
+scheduler:
+  max_num_seqs: 256
+  max_num_batched_tokens: 2048
+
+serving:
+  host: "0.0.0.0"
+  port: 8000
+  cors_allow_origins: ["*"]
+
+metrics:
+  prometheus_port: 9090
+  enable_metrics: true

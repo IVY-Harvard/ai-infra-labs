@@ -1,0 +1,95 @@
+# K8s 调度器配置文件
+# 配置 kube-scheduler 使用 Scheduler Extender 调用自定义 GPU 调度逻辑
+
+apiVersion: kubescheduler.config.k8s.io/v1
+kind: KubeSchedulerConfiguration
+profiles:
+- schedulerName: gpu-topology-scheduler
+  plugins:
+    # 禁用默认的 BalancedAllocation（它倾向分散，与 Bin Packing 冲突）
+    score:
+      disabled:
+      - name: NodeResourcesBalancedAllocation
+      enabled:
+      # 使用 MostAllocated 代替 LeastAllocated（实现 Bin Packing 效果）
+      - name: NodeResourcesFit
+        weight: 5
+  pluginConfig:
+  - name: NodeResourcesFit
+    args:
+      # MostAllocated 策略：优先选择已用资源多的节点
+      scoringStrategy:
+        type: MostAllocated
+        resources:
+        - name: nvidia.com/gpu
+          weight: 10      # GPU 权重最高
+        - name: cpu
+          weight: 1
+        - name: memory
+          weight: 1
+
+# Extender 配置（调用自定义拓扑感知调度器）
+extenders:
+- urlPrefix: "http://gpu-topo-scheduler-svc.kube-system:8888"
+  filterVerb: "filter"
+  prioritizeVerb: "prioritize"
+  weight: 10
+  enableHTTPS: false
+  # 仅对请求了 GPU 的 Pod 调用 Extender
+  managedResources:
+  - name: "nvidia.com/gpu"
+    ignoredByScheduler: false
+  nodeCacheCapable: false
+  ignorable: true    # Extender 不可用时不阻塞调度
+
+---
+# 部署自定义调度器 Extender 为 K8s Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gpu-topo-scheduler
+  namespace: kube-system
+spec:
+  replicas: 2   # 高可用
+  selector:
+    matchLabels:
+      app: gpu-topo-scheduler
+  template:
+    metadata:
+      labels:
+        app: gpu-topo-scheduler
+    spec:
+      containers:
+      - name: scheduler
+        image: gpu-topo-scheduler:v1
+        ports:
+        - containerPort: 8888
+        resources:
+          requests:
+            cpu: 100m
+            memory: 256Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 8888
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /healthz
+            port: 8888
+          periodSeconds: 5
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: gpu-topo-scheduler-svc
+  namespace: kube-system
+spec:
+  selector:
+    app: gpu-topo-scheduler
+  ports:
+  - port: 8888
+    targetPort: 8888

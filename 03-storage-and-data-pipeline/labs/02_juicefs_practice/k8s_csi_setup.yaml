@@ -1,0 +1,124 @@
+---
+# JuiceFS CSI Driver for Kubernetes
+# 适用于 K8s 环境下挂载 JuiceFS 到 Pod
+
+# 1. 安装 JuiceFS CSI Driver
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: juicefs-system
+
+---
+# 2. JuiceFS 凭证 Secret
+apiVersion: v1
+kind: Secret
+metadata:
+  name: juicefs-secret
+  namespace: default
+type: Opaque
+stringData:
+  name: ai-training
+  metaurl: redis://redis-jfs.default.svc:6379/1
+  storage: minio
+  bucket: http://minio.default.svc:9000/jfs-data
+  access-key: minioadmin
+  secret-key: minioadmin123
+
+---
+# 3. StorageClass 定义
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: juicefs-sc
+provisioner: csi.juicefs.com
+parameters:
+  csi.storage.k8s.io/provisioner-secret-name: juicefs-secret
+  csi.storage.k8s.io/provisioner-secret-namespace: default
+  csi.storage.k8s.io/node-publish-secret-name: juicefs-secret
+  csi.storage.k8s.io/node-publish-secret-namespace: default
+  # JuiceFS 挂载参数（AI 训练优化）
+  juicefs/mount-options: >-
+    cache-dir=/nvme/jfs-cache,
+    cache-size=300000,
+    prefetch=3,
+    buffer-size=2048,
+    max-uploads=30
+reclaimPolicy: Retain
+volumeBindingMode: Immediate
+
+---
+# 4. PVC 示例 - 训练数据
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: training-data-pvc
+  namespace: default
+spec:
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 1Ti
+  storageClassName: juicefs-sc
+
+---
+# 5. PVC 示例 - Checkpoint
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: checkpoint-pvc
+  namespace: default
+spec:
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 500Gi
+  storageClassName: juicefs-sc
+
+---
+# 6. 训练 Pod 示例
+apiVersion: v1
+kind: Pod
+metadata:
+  name: training-job
+  namespace: default
+spec:
+  containers:
+    - name: trainer
+      image: pytorch/pytorch:2.3.0-cuda12.1-cudnn8-runtime
+      command: ["python", "train.py"]
+      resources:
+        limits:
+          nvidia.com/gpu: 8
+          memory: 256Gi
+          cpu: "64"
+        requests:
+          nvidia.com/gpu: 8
+          memory: 128Gi
+          cpu: "32"
+      volumeMounts:
+        - name: training-data
+          mountPath: /data
+          readOnly: true
+        - name: checkpoint
+          mountPath: /checkpoints
+        - name: local-cache
+          mountPath: /nvme/jfs-cache
+  volumes:
+    - name: training-data
+      persistentVolumeClaim:
+        claimName: training-data-pvc
+    - name: checkpoint
+      persistentVolumeClaim:
+        claimName: checkpoint-pvc
+    - name: local-cache
+      hostPath:
+        path: /nvme/jfs-cache
+        type: DirectoryOrCreate
+  nodeSelector:
+    gpu-type: h20
+  tolerations:
+    - key: nvidia.com/gpu
+      operator: Exists
+      effect: NoSchedule
